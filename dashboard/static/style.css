@@ -1,0 +1,173 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --card-bg: #ffffff;
+  --text: #1a1d21;
+  --muted: #6b7280;
+  --border: #e2e4e9;
+  --accent: #2563eb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --card-bg: #1e2126;
+    --text: #e8eaed;
+    --muted: #9aa0a6;
+    --border: #2c2f36;
+    --accent: #5b9dff;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-bg);
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.topbar h1 { font-size: 1.1rem; margin: 0; }
+
+.tabs { display: flex; gap: 0.5rem; }
+
+.tab {
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.tab.active { background: var(--accent); color: #fff; }
+
+main { padding: 1.5rem; max-width: 960px; margin: 0 auto; }
+
+.banner {
+  padding: 0.6rem 1.5rem;
+  font-size: 0.85rem;
+}
+
+.banner-error { background: #fee2e2; color: #991b1b; }
+.banner-warn { background: #fef3c7; color: #92400e; }
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.inline-form { margin: 0; }
+
+.btn {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+.last-refreshed, .hint { color: var(--muted); font-size: 0.85rem; }
+
+.autopoll { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: var(--muted); }
+.poll-status { font-size: 0.85rem; color: #92400e; }
+
+.map { height: 320px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+.location-meta {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 0.85rem; color: var(--muted); margin: 0.5rem 0 1.5rem;
+}
+.location-meta a { color: var(--accent); }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+.card.status-ok { border-left: 4px solid #22c55e; }
+.card.status-bad { border-left: 4px solid #ef4444; }
+.card.status-unknown { border-left: 4px solid var(--muted); }
+
+.card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; }
+.card-emoji { font-size: 1.2rem; }
+.card-name { font-weight: 600; }
+.card-detail { color: var(--muted); font-size: 0.8rem; word-break: break-word; }
+
+.screenshot-panel { margin-bottom: 1.5rem; }
+#screenshot-img {
+  display: block;
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-top: 0.5rem;
+}
+
+.legend { color: var(--muted); font-size: 0.8rem; }
+
+.report-textarea {
+  width: 100%;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.85rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+  white-space: pre;
+}
+
+/* Trends — sparklines from logs/history.jsonl. Sized to sit in the same grid rhythm as
+   the status cards above them, so the page reads as one column of panels. */
+.section-title { font-size: 1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
+
+.trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.trend {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem;
+}
+
+.trend-header { display: flex; justify-content: space-between; align-items: baseline; }
+.trend-label { font-size: 0.8rem; color: var(--muted); }
+.trend-latest { font-weight: 600; }
+
+/* The polyline strokes currentColor, so it follows --accent through the dark-mode swap
+   rather than pinning a blue that only reads on one background. */
+.trend-spark { display: block; margin: 0.4rem 0; color: var(--accent); overflow: visible; }
+
+.trend-range { font-size: 0.7rem; color: var(--muted); }

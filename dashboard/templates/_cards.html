@@ -1,0 +1,10 @@
+{# Shared by the full page and the poll's fragment response — see _banners.html. #}
+{% for card in cards %}
+  <div class="card {{ card.css_class }}">
+    <div class="card-header">
+      <span class="card-emoji">{{ card.emoji }}</span>
+      <span class="card-name">{{ card.name }}</span>
+    </div>
+    <div class="card-detail">{{ card.detail }}</div>
+  </div>
+{% endfor %}

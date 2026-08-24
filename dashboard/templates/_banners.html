@@ -1,0 +1,30 @@
+{# The page and the 30s poll both render this. Kept as one partial rather than
+   reimplemented in JavaScript, so a banner can never exist in one and not the other. #}
+{% if request.args.get('refresh') == 'skipped' %}
+  <div class="banner banner-warn">Refresh skipped — another refresh is already in flight.</div>
+{% endif %}
+{% if stale %}
+  {# Loudest banner on the page, and deliberately an error rather than a warning: every
+     other failure here announces itself, but a dead health-agent leaves a green-looking
+     snapshot behind and is invisible without this. #}
+  <div class="banner banner-error">
+    🔴 Snapshot is stale — health.json is {{ '%.0f'|format(age_sec) }}s old and is written
+    every 60s. health-agent.service is not running on the Pi; the values below are frozen
+    and must not be trusted. Check <code>systemctl status health-agent</code> on the truck.
+  </div>
+{% endif %}
+{% if state.connection_error %}
+  <div class="banner banner-error">Connection failed: {{ state.connection_error }}</div>
+{% endif %}
+{% if state.health_error %}
+  <div class="banner banner-warn">health.json: {{ state.health_error }}</div>
+{% endif %}
+{% if state.tailscale_error %}
+  <div class="banner banner-warn">tailscale status: {{ state.tailscale_error }}</div>
+{% endif %}
+{% if state.location_error %}
+  <div class="banner banner-warn">Reverse geocode: {{ state.location_error }} — the town label may be stale.</div>
+{% endif %}
+{% if state.health and state.health.run_dir_fallback %}
+  <div class="banner banner-warn">⚠️ Agent is writing to a fallback run-dir (tmpfiles rule missing on the Pi) — health data is still valid.</div>
+{% endif %}

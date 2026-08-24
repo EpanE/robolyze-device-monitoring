@@ -1,0 +1,24 @@
+{# Sparklines, not a chart library: the shape over time is the whole question ("when did
+   fps start sagging"), and a shape needs no axes, no tooltips and no 300KB dependency.
+   Points are computed server-side in history.py so this stays markup. #}
+{% if trends %}
+  <div class="trend-grid">
+    {% for trend in trends %}
+      <div class="trend">
+        <div class="trend-header">
+          <span class="trend-label">{{ trend.label }}</span>
+          <span class="trend-latest">{{ trend.latest }}</span>
+        </div>
+        <svg class="trend-spark" viewBox="0 0 {{ trend.width }} {{ trend.height }}"
+             width="100%" height="{{ trend.height }}" preserveAspectRatio="none"
+             role="img" aria-label="{{ trend.label }} over the last {{ trend.samples }} refreshes">
+          <polyline points="{{ trend.points }}" fill="none" stroke="currentColor"
+                    stroke-width="1.5" vector-effect="non-scaling-stroke" />
+        </svg>
+        <div class="trend-range">{{ trend.low }} – {{ trend.high }} over {{ trend.samples }} samples</div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="hint">Trends appear after a couple of refreshes.</p>
+{% endif %}

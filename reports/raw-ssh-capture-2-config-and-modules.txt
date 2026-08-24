@@ -1,0 +1,4530 @@
+
+====================================================================================================
+### [claude-md]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/CLAUDE.md 2>&1
+----------------------------------------------------------------------------------------------------
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+# Hailo Road Monitoring — Claude Instructions
+
+## Project Purpose
+Road defect detection system running on Raspberry Pi 5 with a Hailo AI accelerator.
+Detects potholes, cracks, raveling, and stagnant water via RTSP camera stream.
+Uploads detections (image + metadata) to AWS S3 and a Robolyze REST API.
+
+## Environments
+
+This project is developed on a **laptop** and deployed to a **Raspberry Pi 5 + Hailo device** in the client's truck.
+
+**Current environment is auto-detected on every prompt** via `.claude/hooks/detect-device.sh` — no need to tell Claude which device you're on. Claude sees a `[ENV: ...]` tag at the start of each turn.
+
+| | Laptop (x86_64) | Hailo RPi (aarch64) |
+|---|---|---|
+| Edit code | Yes | Yes |
+| Unit tests | Yes | Yes |
+| Full pipeline | No | Yes |
+| `hailo` / `gi.repository` / `hailo_apps` imports | FAIL | OK |
+| Camera / GPS / recording | No | Yes |
+
+**Safe to edit on laptop** (pure Python, no hardware deps):
+`config/` `detection/` `upload/` `utils/` `tests/`
+
+**Laptop-safe tests** (no hardware needed):
+```bash
+pytest tests/test_local_detection_saver.py tests/test_local_save_pipeline.py tests/test_settings_storage_fallback.py tests/test_dual_tier_upload.py tests/test_regression.py -v
+```
+
+**Using Make** (preferred):
+```bash
+make test-local    # laptop-safe tests
+make test-all      # full suite (Hailo RPi only)
+```
+
+**Hailo RPi only:**
+```bash
+pytest tests/test_hailo_rpi5_examples.py   # needs Hailo device + camera
+pytest tests/test_camera.py               # needs RTSP camera
+python tests/test_gps.py                  # needs GPS serial device
+./run_tests.sh                            # full suite (hardware required)
+```
+
+## Running the App
+
+**Development / manual run:**
+```bash
+source setup_env.sh
+python basic_pipelines/detection.py --input rtsp://... --hef-path yolov11n_dataset9-7.hef --labels-json labels.json
+```
+
+**Production (truck) startup script** — 4-phase gated launch:
+```bash
+./run_detection_fps.sh
+```
+Phases: (1) wait for internet, (2) wait for RTSP camera TCP reachability, (3) GPS speed gate (`utils/wait_for_speed.py` — waits until vehicle is moving ≥ `MIN_SPEED_KMH`, default 3 km/h), (4) 7-second stabilisation delay, then `detection.py`.
+
+The camera URL is **not hardcoded** in the script — it reads `RTSP_URL` (then `CAMERA_SOURCE`) from `.env`, mirroring the precedence in `config/settings.py`. `.env` is the single source of truth. It is deliberately parsed key-by-key rather than sourced, because `.env` holds secrets and lines python-dotenv cannot parse, which would abort the script under `set -e`.
+
+## Camera Network
+
+The RTSP camera is an ONVIF device with a **static IP stored in its own flash** — it does *not* use DHCP and will **not** follow a LAN change.
+
+| | |
+|---|---|
+| Address | `192.168.1.102/24`, gateway `192.168.1.1` (static, `DHCP=false`) |
+| MAC | `aa:f9:68:15:1e:ec` (recorded as `CAMERA_MAC` in `.env`) |
+| Model | `General ADA32N1`, firmware `20251204.7369` |
+| Stream | `rtsp://192.168.1.102/live/mainstream` — h264, 2688×1944, 25 fps |
+| ONVIF | `http://192.168.1.102/onvif/device_service` (gSOAP; read ops accept anonymous) |
+| Web UI | `http://192.168.1.102:8080` |
+
+**This is the known failure mode.** On 2026-07-24 the truck LAN moved to `192.168.1.0/24` while the camera kept a static `192.168.0.126`. Phase 2 then retried a dead address for three hours with no clue as to why — the camera was plugged in and streaming perfectly, just unreachable at layer 3.
+
+Diagnosing it:
+
+```bash
+./utils/find_camera.sh      # finds the camera even if its IP drifted off our subnet
+```
+
+Phase 2 runs this automatically after ~60s of failure and logs the result. It works where ONVIF WS-Discovery does not: a stranded camera receives the multicast probe but routes its unicast reply to a gateway that does not exist, so the reply never arrives. Its ARP requests and vendor broadcasts, however, are layer-2 and reach us regardless of addressing.
+
+Re-addressing it (no web UI needed) — `SetNetworkInterfaces` over ONVIF, after adding a temporary alias on the camera's current subnet so it is reachable at all:
+
+```bash
+sudo ip addr add 192.168.0.200/24 dev eth0      # alias on the camera's stale subnet
+curl -X POST -H 'Content-Type: application/soap+xml' --data-binary @setnet.xml \
+     http://<camera-current-ip>/onvif/device_service
+sudo ip addr del 192.168.0.200/24 dev eth0      # runtime-only; never persist this
+```
+
+Note `ip addr add` does **not** survive a reboot. If the pipeline only works while such an alias is up, the camera has not actually been fixed — check `ss -tanp | grep :554` and confirm the local address is the Pi's real one, not an alias.
+
+**Prevention:** give the camera a DHCP reservation on the router against `aa:f9:68:15:1e:ec` and switch it to DHCP. A static IP in device flash is invisible to this repo and diverges silently the moment the LAN changes.
+
+## Logs to Check
+
+`run_detection_fps.sh` writes two timestamped log files per launch into `logs/` (auto-created):
+
+| File | Contents | Use for |
+|------|----------|---------|
+| `logs/runtime_<TS>.log` | Python stdout/stderr + project logger output (also captures ffmpeg recorder stderr and any `print()` calls from `detection.py`) | Pipeline behaviour, upload queue state, GPS fix issues, exceptions |
+| `logs/gst_<TS>.log` | GStreamer messages (level controlled by `GST_DEBUG`, default `2` = WARNING) | RTSP reconnects, decoder errors, pad-link failures, `appsink` drops |
+| `logs/edge_<TS>.log` | Pre-existing project logger file (kept by the Python logger config) | Same content as runtime log but only the structured logger lines |
+
+What to look for in `runtime_<TS>.log`:
+- **`Frame heartbeat frame=N fps=M`** — emitted every ~5s unconditionally from the GStreamer callback. Absence ⇒ pipeline frozen / not receiving frames. Present with `fps=0.00` ⇒ camera connected but no frames flowing.
+- **`Upload worker got both frames None; skipping job`** — error log from `upload/pipeline.py` worker; indicates a bug in the producer side (both labelled and unlabelled frames were `None`).
+- **`Labelled render failed, using raw frame: <exc>`** — warning when off-thread visualizer/`cv2.putText` rendering fails; the unlabelled frame is uploaded as a fallback.
+- Upload queue / dropped jobs warnings, GPS lock errors, S3/API errors.
+
+What to look for in `gst_<TS>.log`:
+- `rtspsrc` reconnect attempts, `Could not open resource`, EOS, decoder underruns.
+- Bump verbosity for deeper diagnosis: `GST_DEBUG=3 ./run_detection_fps.sh` (INFO) or `4` (DEBUG, large files).
+
+Tail live: `tail -F logs/runtime_*.log` and `tail -F logs/gst_*.log`.
+
+### Known Log Warnings (observed in recent runs)
+
+| Pattern | File | Severity | Action |
+|---------|------|----------|--------|
+| `Training queue full (maxsize=N); dropped X job(s)` | runtime / edge | Real — training-tier samples are being lost | Bursts of detections can saturate the training upload worker even with `TRAINING_DATA_QUEUE_SIZE=32`. Tune up via env if drops persist; root cause is S3 PUT latency vs detection rate. |
+| `rtpjitterbuffer ... too big, reset skew` | gst | Network — RTSP clock drift between camera and Pi | No code fix; check camera link / wifi. Becomes a problem only if accompanied by frame heartbeat stalls. |
+| `avdec_h264-0 decreasing timestamp` | gst | Network — out-of-order RTP frames from camera | Same as above; harmless unless `Frame heartbeat` stalls. |
+| `Need to specify a color matrix when using YUV format (I420)` | gst | Cosmetic — appears at pipeline startup | Ignore. |
+| `dbind-WARNING ... AT-SPI: ... org.a11y.Bus was not provided` | runtime | Cosmetic — Tk accessibility bus probe at startup | Ignore. |
+| `Python-dotenv could not parse statement starting at line N` | runtime | Real — malformed line in `.env` | Open `.env` at the reported line; usually a comment missing its leading `#` or an unquoted value with spaces. |
+
+## Key Files
+| Path | Purpose |
+|------|---------|
+| `basic_pipelines/detection.py` | Main entry point; wires all components together in the GStreamer callback |
+| `basic_pipelines/robolyze_detection_app.py` | Custom GStreamer/Hailo app (RTSP, reconnect, UI tap) |
+| `config/settings.py` | All configuration via env vars / `.env` |
+| `detection/filter.py` | Label + confidence filtering |
+| `detection/parser.py` | Converts raw Hailo/YOLO model output to detection dicts |
+| `detection/visualizer.py` | Bounding box drawing |
+| `detection/local_saver.py` | JPEG + YOLO TXT save to disk |
+| `detection/local_save_pipeline.py` | Async queue wrapping local saver |
+| `upload/pipeline.py` | Dual-tier upload orchestration (confirmed S3 + API; training S3 only) |
+| `upload/s3_uploader.py` | boto3 S3 upload |
+| `upload/api_client.py` | REST POST to Robolyze ingest |
+| `upload/batcher.py` | Crack debouncer (delays crack uploads) |
+| `upload/deduplicator.py` | Skips already-uploaded track IDs |
+| `core/recorder/ffmpeg_recorder.py` | ffmpeg RTSP recording |
+| `utils/gps.py` | NMEA GPS reader via serial port |
+| `utils/wait_for_speed.py` | Standalone speed-gate script (called by `run_detection_fps.sh`) |
+| `utils/find_camera.sh` | Locates the camera across subnets when its IP has drifted (see Camera Network) |
+| `utils/shutdown_ui.py` | Tkinter shutdown/stop UI |
+| `yolov11n_dataset9-7.hef` | Compiled Hailo model (current production, used by `run_detection_fps.sh`); `yolov11n_dataset_9_6.hef`, `yolov11n.hef`, and `model.hef` are prior versions retained for fallback/comparison |
+| `labels.json` | Class-index → label name mapping for the HEF model |
+
+## Configuration
+Copy `.env.sample` to `.env` and fill in real values. Never commit `.env`.
+
+Key env vars:
+- `RTSP_URL` — camera source (also read by `run_detection_fps.sh`; `.env` is the single source of truth)
+- `CAMERA_MAC` — camera's MAC, used by `utils/find_camera.sh` to identify it if its IP drifts
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_BUCKET`, `AWS_REGION`
+- `ROBOLYZE_API_KEY`, `ROBOLYZE_API_URL`
+- `RECORD=1` — enable ffmpeg recording
+- `SAVE_DETECTIONS_LOCAL=1` — save JPEG+TXT per detection (deprecated — S3 uploads already cover this; use only for offline debugging)
+- `GPS_ENABLED=1`, `GPS_PORT=/dev/ttyACM0`
+- `MIN_SPEED_KMH` — minimum vehicle speed before pipeline starts (default 3.0)
+- `GPS_SPEED_GATE_TIMEOUT_SEC` — max seconds to wait for GPS fix before skipping speed gate (default 120)
+- `SHUTDOWN_BUTTON_ENABLED=1` — enable Tkinter UI
+- `HAILO_MULTI_PROCESS_SERVICE=1`
+- `DID_STATE_FILE` — path to the persisted dashboard `did` primary-key high-water mark (default `<project_root>/.did_state`)
+- `EXCLUDED_UPLOAD_LABELS` — CSV of detect-only helper classes (default `manhole_drain`) drawn on the live Hailo overlay but never uploaded to the dashboard or S3 at any confidence
+
+Dual-tier S3 env vars:
+- `TRAINING_DATA_ENABLED` — master toggle (default `true`)
+- `TRAINING_DATA_MIN_CONFIDENCE` — lower bound for training tier (default `0.30`)
+- `CONFIRMED_MIN_CONFIDENCE` — threshold between tiers (default `0.75`)
+- `TRAINING_DATA_S3_PREFIX` — S3 folder prefix (default `training_data`)
+- `CONFIRMED_S3_PREFIX` — S3 folder prefix (default `confirmed`)
+- `TRAINING_DATA_QUEUE_SIZE` — separate upload queue size (default `64`)
+- `TRAINING_DATA_JPEG_QUALITY` — lower quality saves bandwidth (default `70`)
+- `UPLOAD_JPEG_QUALITY` — JPEG quality for confirmed S3 uploads / dashboard images (default `85`)
+
+## Detection Labels
+- **Immediate upload**: `potholes`, `pothole`, `raveling`, `stagnant_water`, `sw`
+- **Debounced upload** (5s delay): `cracks`, `crack`
+- **Confirmed threshold**: 0.75 (configurable via `CONFIRMED_MIN_CONFIDENCE`)
+- **Training threshold**: 0.30–0.75 (lower bound via `TRAINING_DATA_MIN_CONFIDENCE`)
+- **Detect-only (never uploaded)**: `manhole_drain` — accuracy-helper classes listed in `EXCLUDED_UPLOAD_LABELS`; shown on the live Hailo overlay but dropped by `LabelFilter` before both tiers, so never sent to the dashboard or S3 at any confidence
+
+## Dual-Tier S3 Upload Architecture
+
+Detections are split into two tiers by confidence in the GStreamer callback (`detection.py`):
+
+**Confirmed tier** (confidence >= `CONFIRMED_MIN_CONFIDENCE`):
+- Labelled image (bboxes drawn) → `confirmed/labelled/{basename}.jpg` → S3 + dashboard API
+- Unlabelled image (raw frame) → `confirmed/unlabelled/images/{basename}.jpg` → S3 only
+- YOLO label → `confirmed/unlabelled/labels/{basename}.txt` → S3 only
+- GPS location attached to API payload
+
+**Training tier** (confidence >= `TRAINING_DATA_MIN_CONFIDENCE` and < `CONFIRMED_MIN_CONFIDENCE`):
+- Unlabelled image → `training_data/images/{basename}.jpg`
+- YOLO label → `training_data/labels/{basename}.txt`
+- Metadata JSON → `training_data/metadata/{basename}.json` (timestamp, label, confidence, bbox, `gps`/`location`/`gps_fix` — GPS coords when a fix is attached, otherwise `gps=null`, `gps_fix=false`, and `location` falls back to the static `LOCATION` env var or `"unknown"`)
+- NOT sent to dashboard API; separate worker thread + queue to avoid starving confirmed uploads
+
+Both tiers use independent `TrackDeduplicator` instances. Training tier has no crack debouncing.
+
+## Blur (Rain) Soft-Flagging
+
+Adds two advisory fields to the confirmed-tier API payload so the dashboard can filter/review/delete rain-blurred false positives. **Soft-flag only** — no detection is ever dropped, suppressed, or altered on the edge; every detection uploads exactly as before.
+
+- `is_blurred` (bool) and `blur_score` (**string**, 2 dp, higher = sharper) are added to `_build_payload` in `upload/pipeline.py`, alongside the existing six fields. The backend ingest was built for exactly these names/types — `is_blurred` (not `blur`) and a stringified score (not a float). Verified against `https://dash.oud.ai/.../ingest/` on 2026-07-23: correct schema returns `201 {"status":"ok","created":1}`.
+- Scored **once per upload job on the worker thread** (`_worker_loop`), on the raw unlabelled frame (drawn bboxes would inflate the score), keeping the GStreamer thread free. Internally the worker still stamps `detection["blur"]`/`detection["blur_score"]`; `_build_payload` renames/stringifies them to the backend contract at the edge.
+- `detection/blur.py`: `BlurDetector` ABC with `detect(frame) -> (is_blur, score)`; v1 `LaplacianBlurDetector` (variance of Laplacian over the road ROI). v2 (learned) plugs in via `register_blur_detector(name, factory)` + `BLUR_METHOD` — no call-site changes.
+- Never fatal: on any scoring error or when disabled, defaults to `is_blurred=false, blur_score="0.0"` (also the "not scored" sentinel) and the upload proceeds.
+- Threshold `14.0` calibrated on 152 production frames (`utils/calibrate_blur.py`). Score tracks brightness (r≈+0.62), so sharp dawn/dusk frames sit near the line — treat `is_blurred=true` as advisory, not authoritative, at low light. Retune via env, no reflash.
+- **Ingest also validates `detect`**: the class must be one of the backend's *active classes* (currently `cracks`, `potholes`, `raveling`, `sw` — note `potholes` is plural). An unknown/singular label returns `400 {"detail":"Detection class '<x>' not found in active classes."}`.
+
+## Storage Priority (auto-selected)
+1. SSD — via `SSD_UUID` or `/mnt/ssd`
+2. Pendrive — via `PENDRIVE_UUID` or `/mnt/pendrive`
+3. SD/internal — via `SD_STORAGE_ROOT` (default `~`)
+
+Falls back gracefully and logs a startup alert if a target drive is unavailable.
+
+## Code Conventions
+- Python 3, type hints encouraged
+- `from __future__ import annotations` at top of modules
+- Dataclasses for config/data objects
+- Logging via the project logger (not `print`) inside library modules; `print` is acceptable in `detection.py` for live console output
+- Do not commit secrets or large binary files
+- Keep changes minimal and focused — avoid refactoring beyond what is asked
+
+====================================================================================================
+### [config-settings-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/config/settings.py 2>&1
+----------------------------------------------------------------------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import os
+from typing import Dict, Iterable, Optional, Tuple
+from typing import Iterator
+
+
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "off"}
+
+
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return default
+
+
+def _parse_float(value: Optional[str], default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _parse_int(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _parse_csv(value: Optional[str], default: Optional[Iterable[str]] = None) -> Tuple[str, ...]:
+    if value is None:
+        items = list(default or [])
+    else:
+        items = [part.strip() for part in value.split(",")]
+    return tuple(item for item in items if item)
+
+
+def _normalize_labels(labels: Iterable[str]) -> Tuple[str, ...]:
+    seen = set()
+    ordered: list[str] = []
+    for label in labels:
+        normalized = (label or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return tuple(ordered)
+
+
+def _get_env(*names: str, default: Optional[str] = None) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+def _iter_mounts() -> Optional[Iterator[Tuple[str, str, str]]]:
+    """Yield (device, mountpoint, fstype) tuples from /proc/mounts."""
+    try:
+        with open("/proc/mounts", "r") as mounts_file:
+            for line in mounts_file:
+                parts = line.split()
+                if len(parts) >= 3:
+                    yield parts[0], parts[1], parts[2]
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _is_mount_ready(path: Path) -> bool:
+    """Return True when path exists, is a mount point, and is writable."""
+    try:
+        return path.exists() and path.is_dir() and os.path.ismount(path) and os.access(
+            path, os.W_OK | os.X_OK
+        )
+    except Exception:
+        return False
+
+
+def _find_mount_by_uuid(uuid: str) -> Optional[Tuple[Path, str]]:
+    """Locate the mount point for a given filesystem UUID without mounting it."""
+    by_uuid_path = Path("/dev/disk/by-uuid") / uuid
+    if not by_uuid_path.exists():
+        return None
+
+    try:
+        device = str(by_uuid_path.resolve())
+    except Exception:
+        return None
+
+    for dev, mountpoint, fstype in _iter_mounts() or []:
+        if dev == device:
+            mount_path = Path(mountpoint)
+            if _is_mount_ready(mount_path):
+                return mount_path, fstype
+    return None
+
+
+def _resolve_path(path_value: str, project_root: Path) -> Path:
+    """Expand ~ and make relative paths project-root absolute."""
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    return path
+
+
+def _external_mount_root_for_path(path: Path) -> Optional[Path]:
+    """Infer expected mount root for external paths under /media or /mnt."""
+    candidate = Path(path).expanduser()
+    parts = candidate.parts
+    if not parts or parts[0] != "/":
+        return None
+    if len(parts) >= 4 and parts[1] == "media":
+        return Path("/", parts[1], parts[2], parts[3])
+    if len(parts) >= 3 and parts[1] == "mnt":
+        return Path("/", parts[1], parts[2])
+    return None
+
+
+def _is_explicit_storage_target_ready(path: Path) -> bool:
+    """Check whether external storage target is writable/mounted when applicable."""
+    mount_root = _external_mount_root_for_path(path)
+    if mount_root is None:
+        return True
+    return _is_mount_ready(mount_root)
+
+
+def _fallback_if_target_unavailable(
+    requested_path: Path,
+    fallback_path: Path,
+    env_name: str,
+    alerts: list[str],
+) -> Path:
+    """Use fallback path when target drive is missing and append a startup alert."""
+    if _is_explicit_storage_target_ready(requested_path):
+        return requested_path
+
+    mount_root = _external_mount_root_for_path(requested_path)
+    mount_display = str(mount_root) if mount_root is not None else str(requested_path)
+    alerts.append(
+        f"{env_name} target '{requested_path}' is unavailable (drive not detected at "
+        f"'{mount_display}'). Falling back to '{fallback_path}'."
+    )
+    return fallback_path
+
+
+def _resolve_preferred_mount(
+    uuid: Optional[str], mountpoint: Path, source_prefix: str
+) -> Optional[Tuple[Path, str]]:
+    """Resolve a preferred storage mount by UUID first, then by mountpoint readiness."""
+    mount_info = _find_mount_by_uuid(uuid) if uuid else None
+    if mount_info:
+        mount_path, _fstype = mount_info
+        return mount_path, f"{source_prefix}:uuid"
+
+    if _is_mount_ready(mountpoint):
+        return mountpoint, f"{source_prefix}:mountpoint"
+
+    return None
+
+
+def _select_storage_root(project_root: Path) -> Tuple[Path, str]:
+    """Pick the preferred storage root: explicit override > SSD > pendrive > SD/internal."""
+    explicit_root = os.getenv("STORAGE_ROOT")
+    if explicit_root:
+        return _resolve_path(explicit_root, project_root), "env:STORAGE_ROOT"
+
+    ssd_uuid = _get_env("SSD_UUID", "STORAGE_SSD_UUID")
+    ssd_mount = _resolve_path(
+        _get_env("SSD_MOUNTPOINT", default="/mnt/ssd") or "/mnt/ssd",
+        project_root,
+    )
+    pendrive_uuid = _get_env("PENDRIVE_UUID", "USB_UUID", "STORAGE_PENDRIVE_UUID")
+    pendrive_mount = _resolve_path(
+        _get_env("PENDRIVE_MOUNTPOINT", "USB_MOUNTPOINT", default="/mnt/pendrive")
+        or "/mnt/pendrive",
+        project_root,
+    )
+    sd_root = _resolve_path(os.getenv("SD_STORAGE_ROOT", str(project_root)), project_root)
+
+    ssd_root = _resolve_preferred_mount(ssd_uuid, ssd_mount, "ssd")
+    if ssd_root:
+        return ssd_root
+
+    pendrive_root = _resolve_preferred_mount(pendrive_uuid, pendrive_mount, "pendrive")
+    if pendrive_root:
+        return pendrive_root
+
+    return sd_root, "sd:fallback"
+
+
+def load_env_file(path: Path, override: bool = False) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if not path.exists():
+        return env
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        # Drop inline comments unless the value is quoted
+        if "#" in value and not (
+            (value.startswith('"') and value.endswith('"'))
+            or (value.startswith("'") and value.endswith("'"))
+        ):
+            value = value.split("#", 1)[0].strip()
+
+        value = _strip_quotes(value)
+        env[key] = value
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+    return env
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_ENV_FILE = _PROJECT_ROOT / ".env"
+load_env_file(_DEFAULT_ENV_FILE, override=False)
+
+API_URL = _get_env("ROBOLYZE_API_URL", "API_URL") or ""
+API_KEY = _get_env("ROBOLYZE_API_KEY", "API_KEY") or ""
+
+AWS_ACCESS_KEY = _get_env("AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY") or ""
+AWS_SECRET_KEY = _get_env("AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY") or ""
+AWS_REGION = _get_env("AWS_REGION", default="ap-southeast-5") or "ap-southeast-5"
+AWS_BUCKET = _get_env("AWS_BUCKET", default="robolyzedatamy") or "robolyzedatamy"
+
+AWS_BASE_URL = _get_env("AWS_BASE_URL") or ""
+if not AWS_BASE_URL and AWS_BUCKET:
+    if AWS_REGION:
+        AWS_BASE_URL = f"https://{AWS_BUCKET}.s3.{AWS_REGION}.amazonaws.com"
+    else:
+        AWS_BASE_URL = f"https://{AWS_BUCKET}.s3.amazonaws.com"
+
+DETECTION_TYPE = os.getenv("DETECTION_TYPE", "road_defect")
+LOCATION = _get_env("LOCATION", "DEVICE_LOCATION") or ""
+
+# Persisted high-water mark for the dashboard `did` primary key. Kept on the
+# project root (always writable, independent of the SSD/pendrive being mounted),
+# overridable via the DID_STATE_FILE env var.
+DID_STATE_FILE = Path(_get_env("DID_STATE_FILE") or (_PROJECT_ROOT / ".did_state"))
+
+CRACK_UPLOAD_DELAY = max(0.0, _parse_float(os.getenv("CRACK_UPLOAD_DELAY"), 5.0))
+
+_DEFAULT_CRACK_LABELS = ("cracks", "crack")
+_DEFAULT_IMMEDIATE_LABELS = (
+    "potholes",
+    "pothole",
+    "raveling",
+    "stagnant_water",
+    "sw",
+)
+
+# Pothole class names get the low-confidence (training-floor) override in both
+# LabelFilter and the confirmed/training tier router. Single source of truth.
+POTHOLE_LABELS = frozenset(("pothole", "potholes"))
+
+CRACK_LABELS = _normalize_labels(_parse_csv(os.getenv("CRACK_LABELS"), _DEFAULT_CRACK_LABELS))
+IMMEDIATE_UPLOAD_LABELS = _normalize_labels(
+    _parse_csv(os.getenv("IMMEDIATE_UPLOAD_LABELS"), _DEFAULT_IMMEDIATE_LABELS)
+)
+INTERESTING_LABELS = _normalize_labels(
+    _parse_csv(
+        os.getenv("INTERESTING_LABELS"),
+        CRACK_LABELS + IMMEDIATE_UPLOAD_LABELS,
+    )
+)
+
+# Accuracy-helper classes the model emits (e.g. manhole_drain) that must be
+# detect-only: drawn on the live Hailo overlay but NEVER uploaded to the
+# dashboard or either S3 tier, at any confidence. Enforced first in LabelFilter
+# so it wins even if a class is also listed in INTERESTING_LABELS. Add future
+# helper classes here or via the EXCLUDED_UPLOAD_LABELS env var (CSV).
+_DEFAULT_EXCLUDED_UPLOAD_LABELS = ("manhole_drain",)
+EXCLUDED_UPLOAD_LABELS = _normalize_labels(
+    _parse_csv(os.getenv("EXCLUDED_UPLOAD_LABELS"), _DEFAULT_EXCLUDED_UPLOAD_LABELS)
+)
+
+MIN_CONFIDENCE = _parse_float(os.getenv("DETECTION_MIN_CONFIDENCE"), 0.50)
+
+# --- Dual-tier S3 storage ---
+TRAINING_DATA_ENABLED = _parse_bool(os.getenv("TRAINING_DATA_ENABLED"), default=True)
+TRAINING_DATA_MIN_CONFIDENCE = _parse_float(os.getenv("TRAINING_DATA_MIN_CONFIDENCE"), 0.30)
+CONFIRMED_MIN_CONFIDENCE = _parse_float(os.getenv("CONFIRMED_MIN_CONFIDENCE"), 0.75)
+TRAINING_DATA_S3_PREFIX = (os.getenv("TRAINING_DATA_S3_PREFIX") or "training_data").strip("/")
+CONFIRMED_S3_PREFIX = (os.getenv("CONFIRMED_S3_PREFIX") or "confirmed").strip("/")
+TRAINING_DATA_QUEUE_SIZE = max(1, _parse_int(os.getenv("TRAINING_DATA_QUEUE_SIZE"), 64))
+TRAINING_DATA_JPEG_QUALITY = max(1, min(100, _parse_int(os.getenv("TRAINING_DATA_JPEG_QUALITY"), 70)))
+UPLOAD_JPEG_QUALITY = max(1, min(100, _parse_int(os.getenv("UPLOAD_JPEG_QUALITY"), 85)))
+
+
+# --- Blur (rain) soft-flagging ---
+# Advisory only: the score rides along on the upload payload so the dashboard can
+# filter rain-blurred false positives. Detections are never dropped or altered.
+BLUR_DETECTION_ENABLED = _parse_bool(os.getenv("BLUR_DETECTION_ENABLED"), default=True)
+BLUR_METHOD = (os.getenv("BLUR_METHOD") or "laplacian").strip().lower()
+
+# Calibrated on 152 production frames: heavy rain scores under ~10, sharp frames
+# above ~15, and 14.0 is the midpoint of the widest gap between them. The score
+# also tracks brightness (r=+0.62), so sharp dawn/dusk frames sit near this line
+# and can false-flag -- retune here rather than reflashing if that shows up.
+BLUR_THRESHOLD = _parse_float(os.getenv("BLUR_THRESHOLD"), 14.0)
+
+
+def _parse_roi(value: Optional[str], default: Tuple[float, float, float, float]):
+    """Parse 'x0,y0,x1,y1' fractions; fall back to `default` if unusable."""
+    if value is None:
+        return default
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4:
+        return default
+    try:
+        x0, y0, x1, y1 = (float(part) for part in parts)
+    except ValueError:
+        return default
+    if not all(0.0 <= v <= 1.0 for v in (x0, y0, x1, y1)):
+        return default
+    if x1 <= x0 or y1 <= y0:
+        return default
+    return (x0, y0, x1, y1)
+
+
+# Road surface for the rear-top-mounted camera, as fractions of the frame.
+# Measured across 152 production frames: they are pillarboxed (content spans
+# x 0.110-0.888) and the red truck body reaches up to y 0.806. These bounds stay
+# inside the content and above the body -- the body is bolted to the camera so it
+# never blurs, and scoring it would mask real blur.
+BLUR_ROI = _parse_roi(os.getenv("BLUR_ROI"), (0.15, 0.45, 0.85, 0.80))
+
+
+@dataclass(frozen=True)
+class Settings:
+    project_root: Path
+    env_file: Path
+    rtsp_url: Optional[str]
+    record_enabled: bool
+    record_dir: Path
+    record_filename: str
+    ffmpeg_path: str
+    storage_root: Path
+    storage_source: str
+    record_subdir: Path
+    shutdown_ui_enabled: bool
+    esc_stop_enabled: bool
+    shutdown_ui_stop_button_enabled: bool
+    shutdown_ui_poweroff_button_enabled: bool
+    shutdown_ui_poweroff_enabled: bool
+    shutdown_ui_poweroff_cmd: str
+    save_detections_local: bool
+    save_detections_root: Path
+    save_detections_queue_size: int
+    save_detections_jpeg_quality: int
+    startup_alerts: Tuple[str, ...]
+
+    @property
+    def record_path(self) -> Path:
+        return self.record_dir / self.record_filename
+
+
+def get_settings(project_root: Path) -> Settings:
+    env_file_value = os.getenv("HAILO_ENV_FILE")
+    env_file = Path(env_file_value).expanduser() if env_file_value else project_root / ".env"
+    load_env_file(env_file, override=False)
+
+    rtsp_url = os.getenv("RTSP_URL") or os.getenv("CAMERA_SOURCE") or None
+    record_enabled = _parse_bool(os.getenv("RECORD"), default=False)
+
+    record_subdir_value = os.getenv("RECORD_SUBDIR", "production/Duromac_roadmonitering/recording")
+    record_subdir = Path(record_subdir_value.strip("/"))
+    storage_root, storage_source = _select_storage_root(project_root)
+    record_dir_default = storage_root / record_subdir
+    startup_alerts: list[str] = []
+
+    record_path_value = os.getenv("RECORD_PATH")
+    if record_path_value:
+        record_path = Path(record_path_value).expanduser()
+        if not record_path.is_absolute():
+            record_path = project_root / record_path
+        requested_record_dir = record_path.parent
+        record_dir = _fallback_if_target_unavailable(
+            requested_record_dir,
+            record_dir_default,
+            "RECORD_PATH",
+            startup_alerts,
+        )
+        record_filename = record_path.name
+        if record_dir == requested_record_dir:
+            storage_root = record_dir
+            storage_source = "record_path"
+    else:
+        record_dir_env = os.getenv("RECORD_DIR")
+        if record_dir_env:
+            requested_record_dir = _resolve_path(record_dir_env, project_root)
+            record_dir = _fallback_if_target_unavailable(
+                requested_record_dir,
+                record_dir_default,
+                "RECORD_DIR",
+                startup_alerts,
+            )
+            if record_dir == requested_record_dir:
+                storage_root = record_dir
+                storage_source = "record_dir"
+        else:
+            record_dir = record_dir_default
+        record_filename = os.getenv("RECORD_FILENAME", "recording.mp4")
+
+    ffmpeg_path = os.getenv("FFMPEG_PATH", "ffmpeg")
+    shutdown_ui_enabled = _parse_bool(
+        _get_env("SHUTDOWN_BUTTON_ENABLED", "UI_SHUTDOWN_ENABLED"),
+        default=False,
+    )
+    esc_stop_enabled = _parse_bool(
+        _get_env("ESC_STOP_ENABLED", "UI_ESC_STOP_ENABLED"),
+        default=True,
+    )
+    shutdown_ui_stop_button_enabled = _parse_bool(
+        _get_env("STOP_BUTTON_ENABLED", "UI_STOP_BUTTON_ENABLED"),
+        default=True,
+    )
+    shutdown_ui_poweroff_button_enabled = _parse_bool(
+        _get_env("SHUTDOWN_POWEROFF_BUTTON_ENABLED", "UI_POWEROFF_BUTTON_ENABLED"),
+        default=True,
+    )
+    shutdown_ui_poweroff_enabled = _parse_bool(
+        _get_env("SHUTDOWN_BUTTON_POWER_OFF_ENABLED", "UI_POWER_OFF_ENABLED"),
+        default=True,
+    )
+    shutdown_ui_poweroff_cmd = (
+        _get_env("SHUTDOWN_BUTTON_POWEROFF_CMD", "UI_POWEROFF_CMD")
+        or "sudo /sbin/poweroff"
+    ).strip()
+    # Deprecated: S3 uploads already cover confirmed images + labels.
+    # Kept for offline debugging only; default False.
+    save_detections_local = _parse_bool(
+        os.getenv("SAVE_DETECTIONS_LOCAL"), default=False
+    )
+    save_detections_root_value = os.getenv("SAVE_DETECTIONS_ROOT")
+    default_save_detections_root = (
+        storage_root / "production" / "Duromac_roadmonitoring" / "pictures"
+    )
+    if save_detections_root_value:
+        requested_save_root = _resolve_path(save_detections_root_value, project_root)
+        save_detections_root = _fallback_if_target_unavailable(
+            requested_save_root,
+            default_save_detections_root,
+            "SAVE_DETECTIONS_ROOT",
+            startup_alerts,
+        )
+    else:
+        save_detections_root = default_save_detections_root
+    save_detections_queue_size = max(
+        1,
+        _parse_int(os.getenv("SAVE_DETECTIONS_QUEUE_SIZE"), 32),
+    )
+    save_detections_jpeg_quality = _parse_int(
+        os.getenv("SAVE_DETECTIONS_JPEG_QUALITY"), 85
+    )
+    save_detections_jpeg_quality = max(1, min(100, save_detections_jpeg_quality))
+
+    return Settings(
+        project_root=project_root,
+        env_file=env_file,
+        rtsp_url=rtsp_url,
+        record_enabled=record_enabled,
+        record_dir=record_dir,
+        record_filename=record_filename,
+        ffmpeg_path=ffmpeg_path,
+        storage_root=storage_root,
+        storage_source=storage_source,
+        record_subdir=record_subdir,
+        shutdown_ui_enabled=shutdown_ui_enabled,
+        esc_stop_enabled=esc_stop_enabled,
+        shutdown_ui_stop_button_enabled=shutdown_ui_stop_button_enabled,
+        shutdown_ui_poweroff_button_enabled=shutdown_ui_poweroff_button_enabled,
+        shutdown_ui_poweroff_enabled=shutdown_ui_poweroff_enabled,
+        shutdown_ui_poweroff_cmd=shutdown_ui_poweroff_cmd,
+        save_detections_local=save_detections_local,
+        save_detections_root=save_detections_root,
+        save_detections_queue_size=save_detections_queue_size,
+        save_detections_jpeg_quality=save_detections_jpeg_quality,
+        startup_alerts=tuple(startup_alerts),
+    )
+
+====================================================================================================
+### [config-yaml]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/config.yaml 2>&1
+----------------------------------------------------------------------------------------------------
+# RPI5 Examples Configuration File
+
+# This is RPI specefic variables
+hailo_apps_infra_path: "auto" # Path to the Hailo Apps Infra repository, relative to the current working directory
+hailo_apps_infra_branch_tag: "25.7.0" # Branch or tag of the Hailo Apps Infra repository to use
+hailo_apps_infra_repo_url:  https://github.com/hailo-ai/hailo-apps-infra.git
+# This is Hailo Apps Infra variables
+hailort_version: "auto" # Options: "auto" (detect from device), "latest" (latest version), or specific version 
+tappas_version: "auto" # Version of the Tappas model to use, set to "auto" to detect automatically
+model_zoo_version: "v2.14.0" # Version of the model zoo to use
+host_arch: "auto" # Options: "rpi" (Raspberry Pi), "x86" (desktop/server), "arm" (generic ARM board) or "auto" (detect from device)
+hailo_arch: "auto" # Options: "hailo8", "hailo8l", or "auto" (detect from device)
+resources_path: "resources" # Path to the resources directory, relative to the current working directory
+virtual_env_name: "venv_hailo_rpi_examples" # Name of the virtual environment to be created 
+server_url: "http://dev-public.hailo.ai/2025_01" # URL of the server to download models from , This is static 
+storage_dir: "hailo_temp_resources" # Directory to store the deb and whl files , this is the default if set to auot or empty 
+tappas_variant: "auto" # Options : "tappas" or " tappa-core"  or "Auto"
+tappas_postproc_path: "auto" # Path to the post-processing script for Tappas, relative to the current working directory. If set to "auto", it will be detected automatically.
+====================================================================================================
+### [gps-troubleshooting-doc]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/doc/gps-troubleshooting.md 2>&1
+----------------------------------------------------------------------------------------------------
+# GPS Troubleshooting Guide
+
+## Architecture: How the GPS Module Works
+
+```
+GPSReader (drain-on-read, no threads, no locks)
+  ├── Opens /dev/ttyACM0 with timeout=0 (non-blocking)
+  ├── On each get_fix() call:
+  │     1. If cache < 0.3s old → return cached fix (microseconds)
+  │     2. Otherwise → drain serial buffer, parse NMEA, cache result
+  └── close() closes the serial port
+```
+
+- **No background thread** — everything runs in the caller's thread
+- **No file lock** — multiple processes can open the port independently
+- **Non-blocking** — `get_fix()` never stalls the detection pipeline
+
+---
+
+## Symptom: Dashboard shows N/A for GPS coordinates
+
+### Root Cause 1 — No Satellite Fix (most common)
+
+**What happens:**
+The GPS module communicates over serial but hasn't locked onto enough satellites. This is normal on first power-up or after moving to a new location.
+
+**Key NMEA indicators:**
+
+| Sentence | Field | No fix | Has fix |
+|---|---|---|---|
+| `$GPGGA` | Field 6 (quality) | `0` | `1` or higher |
+| `$GPRMC` | Field 2 (status) | `V` (void) | `A` (active) |
+| `$GPGSV` | Satellite count | 0 or missing | 4+ with signal > 30 dBHz |
+
+**How to diagnose — read raw NMEA:**
+```bash
+python3 -c "
+import serial, time
+ser = serial.Serial('/dev/ttyACM0', 9600, timeout=2)
+ser.reset_input_buffer()
+end = time.time() + 10
+while time.time() < end:
+    raw = ser.readline()
+    if raw:
+        line = raw.decode('ascii', errors='ignore').strip()
+        if line: print(line)
+ser.close()
+"
+```
+
+Example — **no fix** (0 satellites, quality=0):
+```
+$GPGGA,043005.00,,,,,0,00,99.99,,,,,,*64
+$GPRMC,043005.00,V,,,,,,,,,,N*7A
+```
+
+Example — **has fix** (8 satellites, quality=1):
+```
+$GPGGA,021012.00,0127.4321,S,10352.1234,E,1,08,1.2,45.3,M,,,,*xx
+$GPRMC,021016.00,A,0127.4321,S,10352.1234,E,0.1,0.0,020326,,,A*xx
+```
+
+**What to do:**
+- Move the GPS antenna **outdoors** with clear sky view
+- Cold start (first fix, new location) = **1–15 minutes**
+- Warm start (same location, short power-off) = **15–60 seconds**
+- If stuck at 0 satellites: **unplug and replug the USB GPS module** to power-cycle it
+
+---
+
+### Root Cause 2 — Wrong Baud Rate
+
+**What happens:**
+Data arrives garbled (random characters, not valid NMEA starting with `$GP...`).
+
+**Common GPS baud rates:** `4800`, `9600` (most common), `38400`, `57600`, `115200`
+
+**Fix:** Update `.env`:
+```
+GPS_BAUD=9600   # change to match your hardware
+```
+
+---
+
+### Root Cause 3 — Zero Coordinates Returned as Valid (code bug — fixed)
+
+When pynmea2 parses sentences with empty lat/lon fields, it returns `0.0` (not `None`). The code now rejects `(0.0, 0.0)` as invalid:
+```python
+if lat_f == 0.0 and lon_f == 0.0:
+    valid = False
+```
+
+---
+
+## Quick Diagnostic Checklist
+
+1. **GPS physically connected?**
+   ```bash
+   ls /dev/ttyACM*    # should show /dev/ttyACM0
+   ```
+
+2. **User has port permissions?**
+   ```bash
+   groups    # should include 'dialout'
+   ```
+
+3. **Baud rate correct?**
+   ```bash
+   grep GPS_BAUD .env    # should be 9600 for u-blox 7
+   ```
+
+4. **GPS getting satellite fix?**
+   Read raw NMEA (see Root Cause 1 above). Look for `quality=1` in GGA.
+
+5. **Run the test:**
+   ```bash
+   python tests/test_gps.py
+   ```
+
+---
+
+## Configuration Reference (`.env`)
+
+```
+GPS_ENABLED=1              # 0 to disable GPS entirely
+GPS_PORT=/dev/ttyACM0      # serial port device
+GPS_BAUD=9600              # baud rate (match your hardware)
+GPS_FIX_MAX_AGE_SEC=2      # reject fixes older than this many seconds
+GPS_TEST_WAIT_SEC=120      # how long test_gps.py waits for a fix
+```
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `utils/gps.py` | GPS reader — drain-on-read, non-blocking, 0.3s cache, (0,0) rejection |
+| `tests/test_gps.py` | Test script — waits for fix with 10s progress reporting |
+| `basic_pipelines/detection.py` | Calls `get_fix()` on each frame, attaches GPS to detections |
+| `upload/pipeline.py` | Extracts GPS from detection dict, includes in API payload |
+
+====================================================================================================
+### [storage-doc]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/doc/storage.md 2>&1
+----------------------------------------------------------------------------------------------------
+# 📦 Storage Configuration Guide (SSD / Pendrive / SD Fallback)
+
+This guide explains how to configure external storage (SSD or Pendrive) for recording in the Duromac Road Monitoring System.
+
+## 🎯 Goal
+- Prefer SSD
+- If SSD absent → use Pendrive
+- If both absent → fallback to internal SD card
+- No formatting or data deletion
+
+---
+
+# 🧠 Storage Priority Logic
+
+Application selects storage in this order:
+
+1. SSD (preferred)
+2. Pendrive (fallback)
+3. Internal SD card (last fallback)
+
+Recording folder:
+```
+production/Duromac_roadmonitering/recording
+```
+
+---
+
+# 🔎 Step 1 — Find Pendrive UUID & Filesystem
+
+Insert pendrive and run:
+
+```bash
+lsblk -f
+```
+
+Example output:
+```
+NAME   FSTYPE LABEL UUID        MOUNTPOINT
+sda1   vfat         0AA6-3C97   /media/rasp/0AA6-3C97
+```
+
+Note:
+- Device: `/dev/sda1`
+- UUID: `0AA6-3C97`
+- FSTYPE: `vfat` / `exfat` / `ext4`
+
+---
+
+# 📁 Step 2 — Create Stable Mount Point
+
+```bash
+sudo mkdir -p /mnt/pendrive
+```
+
+---
+
+# 🛑 Step 3 — Unmount Auto-mounted Pendrive
+
+```bash
+sudo umount /media/rasp/0AA6-3C97 || sudo umount /dev/sda1
+```
+
+---
+
+# ⚙️ Step 4 — Add fstab Entry (Persistent Mount)
+
+Open fstab:
+
+```bash
+sudo nano /etc/fstab
+```
+
+Add ONE line depending on filesystem.
+
+## If VFAT (most pendrives)
+```
+UUID=0AA6-3C97  /mnt/pendrive  vfat  nofail,x-systemd.automount,x-systemd.device-timeout=10,uid=1000,gid=1000,umask=022  0  0
+```
+
+## If exFAT
+```
+UUID=<UUID>  /mnt/pendrive  exfat  nofail,x-systemd.automount,x-systemd.device-timeout=10,uid=1000,gid=1000,umask=022  0  0
+```
+
+## If ext4
+```
+UUID=<UUID>  /mnt/pendrive  ext4  nofail,x-systemd.automount,x-systemd.device-timeout=10  0  2
+```
+
+Save and exit.
+
+---
+
+# 🔄 Step 5 — Apply Changes
+
+```bash
+sudo systemctl daemon-reload
+sudo mount -a
+```
+
+Verify:
+```bash
+mount | grep /mnt/pendrive
+df -h | grep /mnt/pendrive
+```
+
+Test write:
+```bash
+touch /mnt/pendrive/test && rm /mnt/pendrive/test
+```
+
+---
+
+# 📂 Step 6 — Create Recording Directory
+
+```bash
+mkdir -p /mnt/pendrive/production/Duromac_roadmonitering/recording
+mkdir -p /mnt/pendrive/production/Duromac_roadmonitering/logs
+mkdir -p /mnt/pendrive/production/Duromac_roadmonitering/images
+```
+
+---
+
+# ⚙️ Step 7 — Configure .env
+
+Edit `.env`:
+
+```
+PENDRIVE_UUID=0AA6-3C97
+PENDRIVE_MOUNTPOINT=/mnt/pendrive
+SD_STORAGE_ROOT=~
+RECORD_SUBDIR=production/Duromac_roadmonitering/recording
+```
+
+If SSD exists:
+```
+SSD_UUID=<ssd uuid>
+SSD_MOUNTPOINT=/mnt/ssd
+```
+
+---
+
+# 🧪 Step 8 — Verify Before Starting Detection
+
+```bash
+mountpoint -q /mnt/pendrive && echo "Pendrive ready" || echo "Pendrive missing"
+```
+
+Detection should print:
+```
+Storage source: pendrive
+Recording path: /mnt/pendrive/production/Duromac_roadmonitering/recording
+```
+
+---
+
+# ⚠️ Production Notes
+
+Pendrive is OK for:
+- Testing
+- Short recordings
+
+Not ideal for:
+- Continuous daily recording
+- Long-term production
+
+### Best setup
+```
+SD card → OS only
+SSD → recordings + logs
+Pendrive → fallback only
+```
+
+---
+
+# 🛠 Troubleshooting
+
+Check USB:
+```bash
+lsusb
+lsblk
+```
+
+Check mount:
+```bash
+sudo mount -a
+```
+
+Check writable:
+```bash
+touch /mnt/pendrive/test
+```
+
+---
+
+# 🏁 Final Architecture
+
+```
+SSD present     → use SSD
+SSD missing     → use Pendrive
+Both missing    → fallback to SD
+```
+
+Ensures:
+- no crash
+- safe fallback
+- production reliability
+
+====================================================================================================
+### [storage-setup-doc]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/doc/storage_setup.md 2>&1
+----------------------------------------------------------------------------------------------------
+# Storage layout for recordings
+
+Goal: prefer an SSD for `/production/Duromac_roadmonitering/recording`, fall back to a pendrive if SSD is not present, and finally fall back to internal SD card storage. Keep external drives safe (no formatting or data deletion).
+
+## How the code chooses a path
+- The app reads `.env`: `SSD_UUID` (optional), `SSD_MOUNTPOINT` (default `/mnt/ssd`), `PENDRIVE_UUID` (optional), `PENDRIVE_MOUNTPOINT` (default `/mnt/pendrive`), `SD_STORAGE_ROOT` (default `~`), and `RECORD_SUBDIR` (default `production/Duromac_roadmonitering/recording`).
+- Selection order:
+  1) If `SSD_UUID` resolves to a mounted device, use it; otherwise, use `SSD_MOUNTPOINT` if mounted and writable.
+  2) If SSD is not available, if `PENDRIVE_UUID` resolves to a mounted device, use it; otherwise, use `PENDRIVE_MOUNTPOINT` if mounted and writable.
+  3) If neither SSD nor pendrive is available, store under `SD_STORAGE_ROOT`.
+- `RECORD_PATH` or `RECORD_DIR` force an explicit location and override SSD/pendrive/internal selection.
+
+## Prepare a stable SSD mount (ext4, non‑destructive)
+1) Identify the SSD partition and UUID (no formatting):
+   ```bash
+   sudo lsblk -f
+   # Note the UUID of the SSD partition you want to use (e.g., /dev/sda1)
+   ```
+2) Create a dedicated mount point:
+   ```bash
+   sudo mkdir -p /mnt/ssd
+   ```
+3) Add a persistent `/etc/fstab` entry using the UUID (avoids auto-mount conflicts and keeps the mount point stable):
+   ```
+   UUID=<your-ssd-uuid>  /mnt/ssd  ext4  nofail,x-systemd.automount,x-systemd.device-timeout=10  0  2
+   ```
+   - `nofail` lets the system boot if the SSD is absent.
+   - `x-systemd.automount` handles mounting on first access, reducing clashes with desktop auto-mounters.
+   - Do **not** add `format` or `mkfs` steps; this keeps existing data intact.
+4) Apply the change safely:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo mount -a   # should mount /mnt/ssd without errors
+   ```
+5) Create the recording folders (non-destructive) and hand ownership to the app user (replace `rasp` if different):
+   ```bash
+   sudo mkdir -p /mnt/ssd/production/Duromac_roadmonitering/recording
+   sudo chown rasp:rasp /mnt/ssd/production/Duromac_roadmonitering/recording
+   ```
+
+## Prepare a stable pendrive mount (non-destructive)
+1) Identify the pendrive partition UUID and filesystem type:
+   ```bash
+   sudo lsblk -f
+   # Note UUID and FSTYPE for your pendrive partition (for example /dev/sdb1)
+   ```
+2) Create a dedicated mount point:
+   ```bash
+   sudo mkdir -p /mnt/pendrive
+   ```
+3) Add one persistent `/etc/fstab` entry (choose the line that matches your pendrive filesystem):
+   ```
+   # ext4 pendrive
+   UUID=<your-pendrive-uuid>  /mnt/pendrive  ext4   nofail,x-systemd.automount,x-systemd.device-timeout=10  0  2
+
+   # exfat/vfat pendrive (use detected fs type)
+   UUID=<your-pendrive-uuid>  /mnt/pendrive  exfat  nofail,x-systemd.automount,x-systemd.device-timeout=10,uid=1000,gid=1000,umask=022  0  0
+   ```
+   - Keep only one matching entry for the pendrive partition.
+   - `nofail` keeps boot working when the pendrive is absent.
+4) Apply and verify:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo mount -a
+   mount | grep /mnt/pendrive
+   ```
+5) Create recording folders and ownership (replace `rasp` if needed):
+   ```bash
+   sudo mkdir -p /mnt/pendrive/production/Duromac_roadmonitering/recording
+   sudo chown rasp:rasp /mnt/pendrive/production/Duromac_roadmonitering/recording
+   ```
+
+## Enable periodic TRIM for the SSD (ext4)
+```bash
+sudo systemctl enable --now fstrim.timer   # weekly by default
+sudo fstrim -av                             # optional one-time check
+```
+
+## Update `.env`
+Set at least:
+```
+SSD_UUID=<your-ssd-uuid>
+SSD_MOUNTPOINT=/mnt/ssd
+PENDRIVE_UUID=<your-pendrive-uuid>
+PENDRIVE_MOUNTPOINT=/mnt/pendrive
+SD_STORAGE_ROOT=~
+RECORD_SUBDIR=production/Duromac_roadmonitering/recording
+```
+Optional aliases also supported for pendrive keys: `USB_UUID` and `USB_MOUNTPOINT`.
+Leave `RECORD_PATH` blank unless you want to force a specific file path.
+
+====================================================================================================
+### [command-txt]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/command.txt 2>&1
+----------------------------------------------------------------------------------------------------
+========================
+
+python basic_pipelines/detection.py --input /dev/video8 --hef-path ./model.hef --labels labels.json
+
+python basic_pipelines/detection.py --input rtsp://admin:@192.168.0.27:554/Streaming/Channels/101 --hef-path ./model.hef --labels labels.json --show-fps
+
+========================
+
+python basic_pipelines/detection_simple.py --input "/home/rasp/miniproj_epan/hailo-rpi5-examples/testing image/Screenshot 2025-12-23 165902.png" --hef-path ./model.hef --labels labels.json
+
+
+========================
+
+python basic_pipelines/detection_simple.py --input "/home/rasp/miniproj_epan/hailo-rpi5-examples/testing image/Image (1189).jpg" --hef-path ./model.hef --labels-json "$(pwd)/labels.json"
+
+
+python basic_pipelines/detection_simple.py --input "/home/rasp/miniproj_epan/hailo-rpi5-examples/testing image/train_1.jpg" --hef-path ./model.hef --labels-json "$(pwd)/labels.json"
+
+=========================
+
+Single image (simple pipeline):
+python basic_pipelines/detection_simple.py --input "/home/rasp/miniproj_epan/hailo-rpi5-examples/Screenshot 2025-12-23 165902.png" --hef-path ./model.hef --labels-json "$(pwd)/labels.json"
+
+Video file (full pipeline):
+python basic_pipelines/detection.py --input /home/rasp/miniproj_epan/hailo-rpi5-examples/resources/videos/example.mp4 --hef-path ./model.hef --labels-json "$(pwd)/labels.json" --show-fps
+
+RTSP stream (full pipeline):
+python basic_pipelines/detection.py --input rtsp://admin:@192.168.0.27:554/Streaming/Channels/101 --hef-path ./model.hef --labels-json "$(pwd)/labels.json" --show-fps
+
+====================================================================================================
+### [saves-record-plan]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/saves_record_pic_update_plan.md 2>&1
+----------------------------------------------------------------------------------------------------
+# Save Record + Picture Update Plan
+
+## Objectives
+1. Save recording output directly to USB path:
+`/media/rasp/KINGSTON/production/Duromac_roadmonitoring/recording`
+2. Save every detection locally as:
+   - Full-frame image (`.png`)
+   - YOLO label file (`.txt`)
+3. Keep detections separated by class folders:
+   - `cracks`
+   - `potholes`
+   - `raveling`
+   - `stagnant_water`
+4. Filename format:
+`YYYY-MM-DD-HH-mm-SS` (with numeric suffix for collisions in the same second)
+
+## Plan
+1. Update recording destination to USB path.
+   - In `.env`, set:
+     - `RECORD=1`
+     - `RECORD_DIR=/media/rasp/KINGSTON/production/Duromac_roadmonitoring/recording`
+   - Keep `RECORD_PATH` unset so `RECORD_DIR` is used directly.
+
+2. Add local detection-save configuration.
+   - Add env flags such as:
+     - `SAVE_DETECTIONS_LOCAL=1`
+     - `SAVE_DETECTIONS_ROOT=/media/rasp/KINGSTON/production/Duromac_roadmonitoring/pictures`
+   - Load these in `config/settings.py`.
+
+3. Implement a dedicated local detection saver module.
+   - Create a module (for example `detection/local_saver.py`) to:
+     - Create and manage directories:
+       - `.../cracks/images`, `.../cracks/labels`
+       - `.../potholes/images`, `.../potholes/labels`
+       - `.../raveling/images`, `.../raveling/labels`
+       - `.../stagnant_water/images`, `.../stagnant_water/labels`
+     - Save one full-frame `.png` and one `.txt` per detection.
+
+4. Enforce class mapping and accepted classes only.
+   - Canonical class map:
+     - `0 = cracks`
+     - `1 = potholes`
+     - `2 = raveling`
+     - `3 = stagnant_water`
+   - Accept aliases and normalize them to canonical class names:
+     - `crack -> cracks`
+     - `pothole -> potholes`
+     - `stagnant water`, `sw` -> `stagnant_water`
+   - Ignore any class outside these 4 categories.
+
+5. Write YOLO labels in normalized format.
+   - For each detection, write one line in the `.txt` file:
+     - `class_id x_center y_center width height`
+   - Convert pixel bbox to normalized values using frame width/height.
+   - Clamp values to `[0, 1]` for robustness.
+
+6. Add filename collision handling.
+   - Primary basename:
+     - `YYYY-MM-DD-HH-mm-SS`
+   - If same-second conflict exists, append suffix:
+     - `-01`, `-02`, etc.
+
+7. Integrate into runtime flow.
+   - Wire saver into `basic_pipelines/detection.py` after filtered detections are available.
+   - Keep existing S3/API upload flow unchanged.
+   - Ensure local saving does not use dedup/debounce logic so every detection is saved.
+
+8. Add tests and verification.
+   - Unit tests:
+     - label normalization and class-id mapping
+     - YOLO normalization math
+     - directory routing and file generation
+     - collision suffix naming
+   - Runtime verification:
+     - confirm recordings go to USB recording directory
+     - confirm per-class `images/` + `labels/` files are generated as expected
+
+
+====================================================================================================
+### [makefile]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/Makefile 2>&1
+----------------------------------------------------------------------------------------------------
+
+# Makefile for running tests
+# See CLAUDE.md for which tests require hardware
+
+PYTEST = python -m pytest -v
+
+# Laptop-safe tests (no hardware deps)
+.PHONY: test-local
+test-local:
+	$(PYTEST) tests/test_local_detection_saver.py tests/test_local_save_pipeline.py tests/test_settings_storage_fallback.py tests/test_dual_tier_upload.py tests/test_regression.py
+
+# Regression tests (laptop-safe)
+.PHONY: test-regression
+test-regression:
+	$(PYTEST) tests/test_regression.py
+
+# Hardware tests (Hailo RPi only)
+.PHONY: test-hailo
+test-hailo:
+	$(PYTEST) tests/test_hailo_rpi5_examples.py
+
+.PHONY: test-camera
+test-camera:
+	$(PYTEST) tests/test_camera.py
+
+.PHONY: test-gps
+test-gps:
+	python tests/test_gps.py
+
+.PHONY: test-s3
+test-s3:
+	$(PYTEST) tests/test_aws_upload_folder_structure.py
+
+# All laptop-safe tests
+.PHONY: test
+test: test-local test-regression
+
+# All tests (requires Hailo RPi + camera + GPS)
+.PHONY: test-all
+test-all:
+	$(PYTEST) tests/
+
+.PHONY: help
+help:
+	@echo "Targets:"
+	@echo "  test            — all laptop-safe tests (default)"
+	@echo "  test-local      — local saver, save pipeline, settings, dual-tier"
+	@echo "  test-regression — comprehensive regression suite"
+	@echo "  test-s3         — AWS S3 upload folder structure"
+	@echo "  test-hailo      — Hailo device tests (RPi only)"
+	@echo "  test-camera     — camera tests (RPi only)"
+	@echo "  test-gps        — GPS serial test (RPi only)"
+	@echo "  test-all        — everything (hardware required)"
+
+====================================================================================================
+### [did-state]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/.did_state 2>&1
+----------------------------------------------------------------------------------------------------
+1785138339198481
+====================================================================================================
+### [ci-yaml]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/ci.yaml 2>&1
+----------------------------------------------------------------------------------------------------
+# .github/workflows/ci.yml
+name: Raspberry Pi Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.x
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip
+        pip install -r requirements.txt
+
+    - name: Run tests
+      run: |
+        bash run_tests.sh
+
+    - name: Upload test results
+      if: failure()
+      uses: actions/upload-artifact@v2
+      with:
+        name: test-results
+        path: pytest-results.xml
+
+====================================================================================================
+### [claude-settings-json]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/.claude/settings.json 2>&1
+----------------------------------------------------------------------------------------------------
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit:*)",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-commit-tests.sh",
+            "timeout": 60,
+            "statusMessage": "Running pre-commit tests..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/detect-device.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check-git-updates.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && ARCH=$(uname -m); if [ \"$ARCH\" != 'aarch64' ] && [ ! -e /dev/hailo0 ]; then pytest tests/test_local_detection_saver.py tests/test_local_save_pipeline.py tests/test_settings_storage_fallback.py -q 2>&1 | tail -8; fi",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+
+====================================================================================================
+### [claude-settings-local-json]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/.claude/settings.local.json 2>&1
+----------------------------------------------------------------------------------------------------
+{
+  "permissions": {
+    "allow": [
+      "Bash(systemctl cat *)",
+      "Bash(systemctl is-enabled *)",
+      "Bash(systemctl is-active *)",
+      "Bash(journalctl -b --no-pager -o short)",
+      "Bash(systemctl show *)",
+      "Bash(systemctl --user status 'app-hailo\\\\x2ddetection\\\\x2dfps@autostart.service' --no-pager)",
+      "Bash(cp ~/.config/autostart/hailo-detection-fps.desktop /tmp/claude-1000/-home-rasp-miniproj-epan-hailo-rpi5-examples/a807ba56-b467-4ca9-b3bf-815d51a5440f/scratchpad/hailo-detection-fps.desktop.bak)",
+      "Bash(rm ~/.config/autostart/hailo-detection-fps.desktop)"
+    ]
+  }
+}
+
+====================================================================================================
+### [claude-hooks-cat]
+CMD: for f in ~/miniproj_epan/hailo-rpi5-examples/.claude/hooks/*.sh; do echo "=== $f ==="; cat "$f"; echo; done 2>&1
+----------------------------------------------------------------------------------------------------
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/.claude/hooks/check-git-updates.sh ===
+#!/bin/bash
+# Checks for remote git updates on any device.
+# Throttled to once per Claude session via a temp flag file.
+# Output is injected as context into Claude's prompt.
+
+# Throttle: only check once per session (flag lives in /tmp, cleared on reboot)
+PROJECT_SLUG=$(echo "$CLAUDE_PROJECT_DIR" | tr '/' '_')
+FLAG_FILE="/tmp/claude_git_checked_${PROJECT_SLUG}"
+
+if [ -f "$FLAG_FILE" ]; then
+    exit 0
+fi
+
+# Mark as checked for this session
+touch "$FLAG_FILE"
+
+# Must be inside a git repo
+cd "$CLAUDE_PROJECT_DIR" || exit 0
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    exit 0
+fi
+
+# Fetch quietly (with timeout via git config)
+git fetch origin --quiet --timeout=5 2>/dev/null
+
+LOCAL=$(git rev-parse HEAD 2>/dev/null)
+REMOTE=$(git rev-parse "@{u}" 2>/dev/null)
+
+if [ -z "$REMOTE" ] || [ "$LOCAL" = "$REMOTE" ]; then
+    exit 0
+fi
+
+# Count how many commits behind
+BEHIND=$(git rev-list HEAD..@{u} --count 2>/dev/null)
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+echo ""
+echo "[GIT UPDATE AVAILABLE] The repo is ${BEHIND} commit(s) behind 'origin/${BRANCH}'."
+echo "Latest remote commits:"
+git log HEAD..@{u} --oneline --no-walk=unsorted 2>/dev/null | head -5
+echo ""
+echo "Ask the user: Should I run 'git pull' to fetch the latest changes before we continue?"
+echo ""
+
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/.claude/hooks/detect-device.sh ===
+#!/bin/bash
+# Auto-detects whether Claude Code is running on a Laptop or the Hailo RPi device.
+# Output is injected as context into every Claude prompt automatically.
+
+ARCH=$(uname -m)
+HAILO_DEV=""
+GPS_DEV=""
+DISPLAY_AVAIL="no"
+
+# Hailo device file (most reliable indicator)
+[ -e /dev/hailo0 ] && HAILO_DEV="/dev/hailo0"
+
+# GPS serial device
+[ -e /dev/ttyACM0 ] && GPS_DEV="/dev/ttyACM0"
+
+# Display server
+{ [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; } && DISPLAY_AVAIL="yes"
+
+if [ -n "$HAILO_DEV" ] || [ "$ARCH" = "aarch64" ]; then
+    HAILO_INFO="${HAILO_DEV:-detected(arch)}"
+    GPS_INFO="${GPS_DEV:-not-found}"
+    echo "[ENV: HAILO-RPi | arch:$ARCH | hailo:$HAILO_INFO | gps:$GPS_INFO | display:$DISPLAY_AVAIL] Full GStreamer/Hailo pipeline available. All imports work."
+else
+    echo "[ENV: LAPTOP | arch:$ARCH | display:$DISPLAY_AVAIL] hailo / gi.repository / hailo_apps imports UNAVAILABLE. Safe to edit: config/ detection/ upload/ utils/ tests/. Cannot run GStreamer pipeline or verify hardware behavior."
+fi
+
+exit 0
+
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/.claude/hooks/pre-commit-tests.sh ===
+#!/usr/bin/env bash
+# PreToolUse(Bash) hook: run laptop-safe tests before a `git commit`.
+# Self-gates on the intercepted command so non-commit Bash calls pass through
+# untouched. Runs under bash (via shebang) so `source` / PIPESTATUS work even
+# when Claude Code invokes hook commands with /bin/sh.
+set -uo pipefail
+
+# The tool-call JSON arrives on stdin; pull out the command being run.
+input="$(cat)"
+cmd="$(printf '%s' "$input" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' 2>/dev/null)"
+
+# Only gate real commits; let everything else through immediately.
+case "$cmd" in
+  *"git commit"*) ;;
+  *) exit 0 ;;
+esac
+
+# CLAUDE_PROJECT_DIR is set at runtime by Claude Code; fall back to the repo
+# root two levels up from this script (.claude/hooks/) when run standalone.
+project_dir="${CLAUDE_PROJECT_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"}"
+cd "$project_dir" || exit 0
+# shellcheck disable=SC1091
+source venv_hailo_rpi_examples/bin/activate 2>/dev/null || true
+
+out="$(python -m pytest \
+  tests/test_local_detection_saver.py \
+  tests/test_local_save_pipeline.py \
+  tests/test_settings_storage_fallback.py \
+  tests/test_dual_tier_upload.py \
+  -q 2>&1)"
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  {
+    echo "Pre-commit tests failed. Fix failing tests before committing."
+    printf '%s\n' "$out" | tail -20
+  } >&2
+  exit 2   # exit code 2 blocks the tool call; stderr is shown to Claude
+fi
+
+exit 0
+
+
+====================================================================================================
+### [upload-pipeline-py]
+CMD: find ~/miniproj_epan/hailo-rpi5-examples/upload -name '*.py' -exec echo '=== {} ===' \; -exec cat {} \; 2>&1
+----------------------------------------------------------------------------------------------------
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__init__.py ===
+"""Upload helpers."""
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/s3_uploader.py ===
+"""S3 upload helpers."""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import boto3
+
+
+class S3Uploader:
+    """Upload JPEG bytes to S3."""
+
+    def __init__(
+        self,
+        aws_access_key: str,
+        aws_secret_key: str,
+        aws_region: str,
+        aws_bucket: str,
+        aws_base_url: str,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._logger = logger or logging.getLogger(__name__)
+        self._bucket = aws_bucket
+        self._base_url = aws_base_url.rstrip("/")
+        self._client = boto3.client(
+            "s3",
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=aws_region,
+        )
+
+    def upload_bytes(self, data: bytes, key: str, content_type: str = "image/jpeg") -> Optional[str]:
+        try:
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+            return f"{self._base_url}/{key}"
+        except Exception as exc:
+            self._logger.error("S3 upload failed key=%s error=%s", key, exc)
+            return None
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/batcher.py ===
+"""Debounce logic for crack uploads."""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any, Callable, Optional, Tuple
+
+
+class CrackDebouncer:
+    """Keep only the most recent crack detection within a time window."""
+
+    def __init__(
+        self,
+        delay_seconds: float,
+        callback: Callable[[Any, Any, dict], None],
+    ) -> None:
+        self.delay_seconds = delay_seconds
+        self._callback = callback
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._payload: Optional[Tuple[Any, Any, dict]] = None
+        self.last_scheduled_at: Optional[float] = None
+
+    def schedule(self, frame_labelled, frame_unlabelled, detection: dict) -> None:
+        with self._lock:
+            self._payload = (frame_labelled, frame_unlabelled, detection.copy())
+            self.last_scheduled_at = time.time()
+            # Start a timer only if one is not already pending. We keep updating
+            # the payload so the timer flush uploads the latest crack in the window.
+            if self._timer is None:
+                self._timer = threading.Timer(self.delay_seconds, self._flush)
+                self._timer.daemon = True
+                self._timer.start()
+
+    def is_pending(self) -> bool:
+        with self._lock:
+            return self._timer is not None
+
+    def _flush(self) -> None:
+        with self._lock:
+            payload = self._payload
+            self._payload = None
+            self._timer = None
+        if payload:
+            frame_labelled, frame_unlabelled, detection = payload
+            self._callback(frame_labelled, frame_unlabelled, detection)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            payload = self._payload
+            self._payload = None
+        if payload:
+            frame_labelled, frame_unlabelled, detection = payload
+            self._callback(frame_labelled, frame_unlabelled, detection)
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/deduplicator.py ===
+"""Track-based and spatial deduplication helpers."""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Deque, Optional, Set, Tuple
+
+
+class TrackDeduplicator:
+    """Prevent repeated uploads for the same target."""
+
+    def __init__(self, max_size: int = 1000, spatial_quant_px: int = 32) -> None:
+        self._max_size = max(1, max_size)
+        self._order: Deque[int] = deque()
+        self._seen: Set[int] = set()
+        self._spatial_order: Deque[Tuple] = deque()
+        self._spatial_seen: Set[Tuple] = set()
+        self._spatial_quant = max(1, spatial_quant_px)
+
+    def should_upload(self, detection: dict) -> bool:
+        track_id = detection.get("track_id")
+        key = self._spatial_key(detection)
+
+        if key is not None and key in self._spatial_seen:
+            return False
+        if track_id is not None and track_id in self._seen:
+            return False
+
+        if track_id is not None:
+            self._track_add(track_id)
+        if key is not None:
+            self._spatial_add(key)
+        return True
+
+    def _track_add(self, track_id: int) -> None:
+        self._seen.add(track_id)
+        self._order.append(track_id)
+        if len(self._order) > self._max_size:
+            oldest = self._order.popleft()
+            self._seen.discard(oldest)
+
+    def _spatial_add(self, key: Tuple) -> None:
+        self._spatial_seen.add(key)
+        self._spatial_order.append(key)
+        if len(self._spatial_order) > self._max_size:
+            oldest = self._spatial_order.popleft()
+            self._spatial_seen.discard(oldest)
+
+    def _spatial_key(self, detection: dict) -> Optional[Tuple]:
+        bbox = detection.get("bbox")
+        if not bbox or len(bbox) != 4:
+            return None
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        cx = int(((x1 + x2) / 2) // self._spatial_quant)
+        cy = int(((y1 + y2) / 2) // self._spatial_quant)
+        w = int((x2 - x1) // self._spatial_quant)
+        h = int((y2 - y1) // self._spatial_quant)
+        label = _normalize_label(detection.get("class_name"))
+        return (label, cx, cy, w, h)
+
+
+def _normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/api_client.py ===
+"""API client with basic retry handling."""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Dict, Optional
+
+import requests
+
+
+class ApiClient:
+    """POST detection payloads to the backend API."""
+
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        logger: Optional[logging.Logger] = None,
+        retries: int = 3,
+        timeout: float = 6.0,
+    ) -> None:
+        self._api_url = api_url
+        self._api_key = api_key
+        self._logger = logger or logging.getLogger(__name__)
+        self._retries = max(1, retries)
+        self._timeout = timeout
+
+    def post(self, payload: Dict) -> bool:
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": self._api_key,
+        }
+        for attempt in range(1, self._retries + 1):
+            try:
+                response = requests.post(
+                    self._api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self._timeout,
+                )
+                if response.status_code in (200, 201):
+                    self._logger.info(
+                        "API_POST success attempt=%s status=%s",
+                        attempt,
+                        response.status_code,
+                    )
+                    return True
+                self._logger.warning(
+                    "API_POST status=%s attempt=%s",
+                    response.status_code,
+                    attempt,
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "API_POST failed attempt=%s error=%s", attempt, exc
+                )
+                time.sleep(1)
+        return False
+=== /home/rasp/miniproj_epan/hailo-rpi5-examples/upload/pipeline.py ===
+"""Upload pipeline orchestration."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+import time
+from typing import Dict, Iterable, Optional
+
+import cv2
+
+from config.settings import (
+    API_KEY,
+    API_URL,
+    AWS_ACCESS_KEY,
+    AWS_BASE_URL,
+    AWS_BUCKET,
+    AWS_REGION,
+    AWS_SECRET_KEY,
+    BLUR_DETECTION_ENABLED,
+    BLUR_METHOD,
+    BLUR_ROI,
+    BLUR_THRESHOLD,
+    CONFIRMED_MIN_CONFIDENCE,
+    CONFIRMED_S3_PREFIX,
+    CRACK_LABELS,
+    CRACK_UPLOAD_DELAY,
+    DETECTION_TYPE,
+    DID_STATE_FILE,
+    IMMEDIATE_UPLOAD_LABELS,
+    LOCATION,
+    TRAINING_DATA_ENABLED,
+    TRAINING_DATA_JPEG_QUALITY,
+    TRAINING_DATA_QUEUE_SIZE,
+    TRAINING_DATA_S3_PREFIX,
+)
+from detection.blur import create_blur_detector
+from detection.local_saver import _bbox_to_yolo_line, _resolve_label
+from upload.api_client import ApiClient
+from upload.batcher import CrackDebouncer
+from upload.deduplicator import TrackDeduplicator
+from upload.s3_uploader import S3Uploader
+
+_QUEUE_STOP = object()
+_module_logger = logging.getLogger(__name__)
+_did_lock = threading.Lock()
+
+
+def _load_last_did() -> int:
+    """Read the persisted `did` high-water mark; 0 if missing or corrupt."""
+    try:
+        return int(DID_STATE_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _persist_did(value: int) -> None:
+    """Atomically persist the high-water mark; log and continue on failure."""
+    try:
+        tmp_path = f"{DID_STATE_FILE}.tmp"
+        with open(tmp_path, "w") as handle:
+            handle.write(str(value))
+        os.replace(tmp_path, DID_STATE_FILE)
+    except OSError as exc:
+        _module_logger.warning("Failed to persist did high-water mark: %s", exc)
+
+
+_last_did = _load_last_did()
+
+
+def _next_did() -> int:
+    """Return a strictly increasing, collision-free detection id.
+
+    Uses epoch microseconds, never emits a value <= the last one issued (so
+    same-microsecond bursts stay unique), and persists the high-water mark so
+    restarts and backward clock steps cannot reproduce an earlier id. The value
+    is ~16 digits, well within the dashboard's 19-digit BIGINT `did` column.
+    """
+    global _last_did
+    with _did_lock:
+        candidate = int(time.time() * 1_000_000)
+        if candidate <= _last_did:
+            candidate = _last_did + 1
+        _last_did = candidate
+        _persist_did(candidate)
+        return candidate
+
+
+@dataclass
+class UploadRecord:
+    url: str
+    timestamp: str
+    label: str
+
+
+class UploadPipeline:
+    """Handle immediate and debounced uploads with dual-tier S3 storage."""
+
+    def __init__(
+        self,
+        logger,
+        jpeg_quality: int = 85,
+        dedup_size: int = 5000,
+        upload_queue_size: int = 8,
+        visualizer=None,
+    ) -> None:
+        self._logger = logger
+        self._jpeg_quality = jpeg_quality
+        self._visualizer = visualizer  # Used by worker to render labelled frame on demand
+        self._deduplicator = TrackDeduplicator(dedup_size)
+        self._tz = timezone(timedelta(hours=8))
+        self.last_upload: Optional[UploadRecord] = None
+        self._warned_no_s3 = False
+        self._warned_no_api = False
+        self._last_status_log_at = 0.0
+        self._upload_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(upload_queue_size)),
+        )
+        self._dropped_jobs = 0
+        self._last_drop_log_at = 0.0
+        self._closed = False
+
+        self._s3 = None
+        self._api = None
+        missing_s3 = [
+            name
+            for name, value in (
+                ("AWS_ACCESS_KEY_ID", AWS_ACCESS_KEY),
+                ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_KEY),
+                ("AWS_BUCKET", AWS_BUCKET),
+            )
+            if not value
+        ]
+        if not missing_s3:
+            self._s3 = S3Uploader(
+                AWS_ACCESS_KEY,
+                AWS_SECRET_KEY,
+                AWS_REGION,
+                AWS_BUCKET,
+                AWS_BASE_URL,
+                logger=logger,
+            )
+        else:
+            self._logger.warning(
+                "S3 credentials missing; uploads disabled missing=%s",
+                ", ".join(missing_s3),
+            )
+
+        if API_URL and API_KEY:
+            self._api = ApiClient(API_URL, API_KEY, logger=logger)
+        else:
+            self._logger.warning(
+                "API credentials missing; API posts disabled missing=%s",
+                ", ".join(
+                    [
+                        name
+                        for name, value in (
+                            ("ROBOLYZE_API_URL", API_URL),
+                            ("ROBOLYZE_API_KEY", API_KEY),
+                        )
+                        if not value
+                    ]
+                ),
+            )
+
+        # Blur soft-flagging. Scored on the worker thread (see _worker_loop) so the
+        # GStreamer streaming thread stays free of the extra cv2 pass.
+        self._blur_detector = None
+        if BLUR_DETECTION_ENABLED:
+            self._blur_detector = create_blur_detector(
+                BLUR_METHOD, BLUR_THRESHOLD, BLUR_ROI, logger=logger,
+            )
+            self._logger.info(
+                "Blur soft-flagging enabled method=%s threshold=%.2f roi=%s",
+                BLUR_METHOD, BLUR_THRESHOLD, BLUR_ROI,
+            )
+        self._warned_blur_error = False
+
+        self._crack_debouncer = CrackDebouncer(
+            CRACK_UPLOAD_DELAY, self._enqueue_crack,
+        )
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="upload-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+        # --- Training tier ---
+        self._training_enabled = TRAINING_DATA_ENABLED and self._s3 is not None
+        self._training_jpeg_quality = TRAINING_DATA_JPEG_QUALITY
+        self._training_deduplicator = TrackDeduplicator(dedup_size)
+        self._training_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, TRAINING_DATA_QUEUE_SIZE),
+        )
+        self._training_dropped_jobs = 0
+        self._training_last_drop_log_at = 0.0
+        self._training_worker: Optional[threading.Thread] = None
+        if self._training_enabled:
+            self._training_worker = threading.Thread(
+                target=self._training_worker_loop,
+                name="training-upload-worker",
+                daemon=True,
+            )
+            self._training_worker.start()
+
+        self._logger.info(
+            "Upload pipeline ready bucket=%s region=%s base_url=%s api_url=%s crack_delay=%.2fs training=%s",
+            AWS_BUCKET or "-",
+            AWS_REGION or "-",
+            AWS_BASE_URL or "-",
+            API_URL or "-",
+            CRACK_UPLOAD_DELAY,
+            self._training_enabled,
+        )
+        self._logger.info(
+            "Upload labels immediate=%s crack=%s",
+            ",".join(IMMEDIATE_UPLOAD_LABELS) if IMMEDIATE_UPLOAD_LABELS else "-",
+            ",".join(CRACK_LABELS) if CRACK_LABELS else "-",
+        )
+        if self._training_enabled:
+            self._logger.info(
+                "Training tier enabled s3_prefix=%s jpeg_quality=%s queue_size=%s",
+                TRAINING_DATA_S3_PREFIX,
+                self._training_jpeg_quality,
+                TRAINING_DATA_QUEUE_SIZE,
+            )
+
+    # ------------------------------------------------------------------
+    # Confirmed tier (>= CONFIRMED_MIN_CONFIDENCE)
+    # ------------------------------------------------------------------
+
+    def process_frame(
+        self,
+        frame_labelled,
+        frame_unlabelled,
+        detections: Iterable[Dict],
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+        *,
+        fps: float = 0.0,
+        detection_count: Optional[int] = None,
+    ) -> None:
+        # If frame_labelled is None, the worker will render it from frame_unlabelled
+        # using self._visualizer + the supplied fps / detection_count overlays.
+        # This keeps the streaming thread free of cv2.copy/draw/putText work.
+        detections = list(detections)
+        if not detections:
+            return
+        if self._s3 is None:
+            if not self._warned_no_s3:
+                self._logger.warning(
+                    "Upload skipped: S3 not configured; set AWS_ACCESS_KEY_ID, "
+                    "AWS_SECRET_ACCESS_KEY, and AWS_BUCKET"
+                )
+                self._warned_no_s3 = True
+            return
+
+        # Rate-limit a high-level heartbeat so users can see the uploader is active.
+        now_monotonic = time.monotonic()
+        if now_monotonic - self._last_status_log_at >= 5.0:
+            labels_preview = ",".join(
+                sorted({_normalize_label(d.get("class_name")) for d in detections if d})
+            )
+            self._logger.info(
+                "Uploader heartbeat frame=%s detections=%s labels=%s",
+                frame_index,
+                len(detections),
+                labels_preview or "-",
+            )
+            self._last_status_log_at = now_monotonic
+
+        cracks = []
+        immediate = []
+        for detection in detections:
+            label = _normalize_label(detection.get("class_name"))
+            if label in CRACK_LABELS:
+                cracks.append(detection)
+            elif label in IMMEDIATE_UPLOAD_LABELS:
+                immediate.append(detection)
+
+        immediate_filtered = []
+        for detection in immediate:
+            if not self._deduplicator.should_upload(detection):
+                self._logger.debug(
+                    "Immediate upload skipped (dedup) label=%s track_id=%s",
+                    _normalize_label(detection.get("class_name")),
+                    detection.get("track_id"),
+                )
+                continue
+            immediate_filtered.append(detection)
+
+        if immediate_filtered:
+            self._enqueue_upload(
+                frame_labelled, frame_unlabelled, immediate_filtered,
+                frame_index, frame_width, frame_height, is_crack=False,
+                fps=fps, detection_count=detection_count,
+            )
+
+        if cracks:
+            crack_det = cracks[-1]
+            if not self._deduplicator.should_upload(crack_det):
+                self._logger.debug(
+                    "Crack upload skipped (dedup) label=%s track_id=%s",
+                    _normalize_label(crack_det.get("class_name")),
+                    crack_det.get("track_id"),
+                )
+            else:
+                if not self._crack_debouncer.is_pending():
+                    self._logger.info(
+                        "Crack upload scheduled in %.2fs (will upload last crack in window)",
+                        CRACK_UPLOAD_DELAY,
+                    )
+                crack_det = crack_det.copy()
+                crack_det["_frame_width"] = frame_width
+                crack_det["_frame_height"] = frame_height
+                crack_det["_fps"] = fps
+                crack_det["_detection_count"] = detection_count
+                self._crack_debouncer.schedule(
+                    frame_labelled, frame_unlabelled, crack_det,
+                )
+
+    # ------------------------------------------------------------------
+    # Training tier (TRAINING_DATA_MIN_CONFIDENCE to < CONFIRMED_MIN_CONFIDENCE)
+    # ------------------------------------------------------------------
+
+    def process_training_frame(
+        self,
+        frame_raw,
+        detections: Iterable[Dict],
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        if not self._training_enabled:
+            return
+        detections = list(detections)
+        if not detections:
+            return
+
+        filtered = [
+            detection for detection in detections
+            if self._training_deduplicator.should_upload(detection)
+        ]
+        if not filtered:
+            return
+
+        self._enqueue_training(
+            frame_raw, filtered, frame_index, frame_width, frame_height,
+        )
+
+    # ------------------------------------------------------------------
+    # Flush / close
+    # ------------------------------------------------------------------
+
+    def flush(self, timeout_sec: Optional[float] = None) -> None:
+        self._crack_debouncer.flush()
+        self._wait_for_queue_drain(timeout_sec=timeout_sec)
+        self._flush_drop_log()
+        if self._training_enabled:
+            self._wait_for_training_queue_drain(timeout_sec=timeout_sec)
+
+    def close(self, timeout_sec: float = 10.0) -> None:
+        if self._closed:
+            return
+        self.flush(timeout_sec=timeout_sec)
+        self._closed = True
+
+        # Stop confirmed worker
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            try:
+                self._upload_queue.put(_QUEUE_STOP, timeout=0.1)
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    self._logger.warning(
+                        "Upload worker stop timed out while queue"
+                        " remained full"
+                    )
+                    break
+        self._worker.join(timeout=max(0.0, float(timeout_sec)))
+        if self._worker.is_alive():
+            self._logger.warning(
+                "Upload worker did not stop within %.1fs",
+                timeout_sec,
+            )
+
+        # Stop training worker
+        if self._training_worker is not None:
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            while True:
+                try:
+                    self._training_queue.put(_QUEUE_STOP, timeout=0.1)
+                    break
+                except queue.Full:
+                    if time.monotonic() >= deadline:
+                        self._logger.warning(
+                            "Training worker stop timed out while queue remained full"
+                        )
+                        break
+            self._training_worker.join(timeout=max(0.0, float(timeout_sec)))
+            if self._training_worker.is_alive():
+                self._logger.warning(
+                    "Training worker did not stop within %.1fs",
+                    timeout_sec,
+                )
+
+    # ------------------------------------------------------------------
+    # Confirmed upload methods
+    # ------------------------------------------------------------------
+
+    def _upload_immediate(
+        self,
+        labelled_bytes: bytes,
+        unlabelled_bytes: Optional[bytes],
+        detection: Dict,
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        label = _normalize_label(detection.get("class_name"))
+        now = datetime.now(self._tz)
+        basename = _build_basename(label, frame_index, now)
+
+        # 1. Upload labelled image (with bboxes) → S3 + API
+        labelled_key = f"{CONFIRMED_S3_PREFIX}/labelled/{basename}.jpg"
+        self._logger.info(
+            "S3 upload start label=%s frame=%s track_id=%s key=%s",
+            label, frame_index, detection.get("track_id"), labelled_key,
+        )
+        url = self._s3.upload_bytes(labelled_bytes, labelled_key)
+        if not url:
+            self._logger.error("S3 upload failed label=%s key=%s", label, labelled_key)
+            return
+        self._logger.info("S3 upload success label=%s url=%s", label, url)
+        payload = _build_payload(label, url, detection)
+        if self._api:
+            self._api.post(payload)
+        else:
+            if not self._warned_no_api:
+                self._logger.warning(
+                    "API post skipped: API not configured; set ROBOLYZE_API_URL and ROBOLYZE_API_KEY"
+                )
+                self._warned_no_api = True
+        self.last_upload = UploadRecord(url=url, timestamp=now.isoformat(), label=label)
+
+        # 2. Upload unlabelled image (raw) + YOLO label → S3 only
+        if unlabelled_bytes is not None:
+            self._upload_confirmed_unlabelled(
+                unlabelled_bytes, detection, basename, frame_width, frame_height,
+            )
+
+    def _upload_confirmed_unlabelled(
+        self,
+        image_bytes: bytes,
+        detection: Dict,
+        basename: str,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        prefix = f"{CONFIRMED_S3_PREFIX}/unlabelled"
+
+        img_key = f"{prefix}/images/{basename}.jpg"
+        url = self._s3.upload_bytes(image_bytes, img_key)
+        if not url:
+            self._logger.error("S3 unlabelled upload failed key=%s", img_key)
+            return
+
+        resolved = _resolve_label(detection.get("class_name"))
+        if resolved:
+            _, class_id = resolved
+            yolo_line = _bbox_to_yolo_line(
+                detection.get("bbox"), class_id, frame_width, frame_height,
+            )
+            if yolo_line:
+                label_key = f"{prefix}/labels/{basename}.txt"
+                self._s3.upload_bytes(
+                    (yolo_line + "\n").encode("utf-8"),
+                    label_key,
+                    content_type="text/plain",
+                )
+
+    def _upload_crack(
+        self,
+        labelled_bytes: bytes,
+        unlabelled_bytes: Optional[bytes],
+        detection: Dict,
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        label = _normalize_label(detection.get("class_name"))
+        now = datetime.now(self._tz)
+        basename = _build_basename(label, frame_index, now)
+
+        # 1. Upload labelled image → S3 + API
+        labelled_key = f"{CONFIRMED_S3_PREFIX}/labelled/{basename}.jpg"
+        self._logger.info(
+            "S3 upload start (crack) label=%s track_id=%s key=%s",
+            label, detection.get("track_id"), labelled_key,
+        )
+        url = self._s3.upload_bytes(labelled_bytes, labelled_key)
+        if not url:
+            self._logger.error("S3 upload failed (crack) label=%s key=%s", label, labelled_key)
+            return
+        self._logger.info("S3 upload success (crack) label=%s url=%s", label, url)
+        payload = _build_payload(label, url, detection)
+        if self._api:
+            self._api.post(payload)
+        else:
+            if not self._warned_no_api:
+                self._logger.warning(
+                    "API post skipped: API not configured; set ROBOLYZE_API_URL and ROBOLYZE_API_KEY"
+                )
+                self._warned_no_api = True
+        self.last_upload = UploadRecord(url=url, timestamp=now.isoformat(), label=label)
+
+        # 2. Upload unlabelled image + YOLO label → S3 only
+        if unlabelled_bytes is not None and frame_width > 0 and frame_height > 0:
+            self._upload_confirmed_unlabelled(
+                unlabelled_bytes, detection, basename, frame_width, frame_height,
+            )
+
+    # ------------------------------------------------------------------
+    # Confirmed queue management
+    # ------------------------------------------------------------------
+
+    def _enqueue_upload(
+        self,
+        frame_labelled,
+        frame_unlabelled,
+        detections,
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+        *,
+        is_crack: bool,
+        fps: float = 0.0,
+        detection_count: Optional[int] = None,
+    ) -> None:
+        if self._closed:
+            return
+        try:
+            self._upload_queue.put_nowait(
+                (frame_labelled, frame_unlabelled,
+                 [d.copy() for d in detections],
+                 frame_index, frame_width, frame_height, is_crack,
+                 fps, detection_count),
+            )
+        except queue.Full:
+            self._dropped_jobs += 1
+            now = time.monotonic()
+            if now - self._last_drop_log_at >= 1.0:
+                self._logger.warning(
+                    "Upload queue full (maxsize=%s); "
+                    "dropped %s job(s)",
+                    self._upload_queue.maxsize,
+                    self._dropped_jobs,
+                )
+                self._dropped_jobs = 0
+                self._last_drop_log_at = now
+
+    def _enqueue_crack(
+        self, frame_labelled, frame_unlabelled, detection: Dict,
+    ) -> None:
+        now = datetime.now(self._tz)
+        frame_index = int(now.timestamp())
+        frame_width = detection.pop("_frame_width", 0)
+        frame_height = detection.pop("_frame_height", 0)
+        fps = detection.pop("_fps", 0.0)
+        detection_count = detection.pop("_detection_count", None)
+        self._enqueue_upload(
+            frame_labelled, frame_unlabelled, [detection], frame_index,
+            frame_width, frame_height, is_crack=True,
+            fps=fps, detection_count=detection_count,
+        )
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._upload_queue.get()
+            try:
+                if item is _QUEUE_STOP:
+                    return
+                (frame_labelled, frame_unlabelled, detections,
+                 frame_index, frame_width, frame_height, is_crack,
+                 fps, detection_count) = item
+                # If the producer (streaming thread) skipped drawing, render the
+                # labelled frame here so the cv2.copy/draw/putText cost moves
+                # off the GStreamer thread.
+                if frame_labelled is None:
+                    if frame_unlabelled is None:
+                        self._logger.error(
+                            "Upload worker got both frames None; skipping job"
+                        )
+                        continue
+                    frame_labelled = self._render_labelled(
+                        frame_unlabelled, detections, fps, detection_count,
+                    )
+                # Score blur on the raw frame, not the labelled one: the drawn
+                # bboxes add edges that inflate the sharpness score. One score per
+                # job, stamped onto every detection it covers.
+                blur_flag, blur_score = self._compute_blur(
+                    frame_unlabelled if frame_unlabelled is not None else frame_labelled
+                )
+                for detection in detections:
+                    detection["blur"] = blur_flag
+                    detection["blur_score"] = blur_score
+
+                labelled_bytes = self._encode(frame_labelled, self._jpeg_quality)
+                if labelled_bytes is None:
+                    continue
+                unlabelled_bytes = None
+                if frame_unlabelled is not None:
+                    # If unlabelled encode fails, proceed with labelled-only:
+                    # the dashboard upload is more important than the raw S3 copy.
+                    unlabelled_bytes = self._encode(
+                        frame_unlabelled, self._jpeg_quality,
+                    )
+                if is_crack:
+                    for detection in detections:
+                        self._upload_crack(
+                            labelled_bytes, unlabelled_bytes, detection,
+                            frame_index, frame_width, frame_height,
+                        )
+                else:
+                    for detection in detections:
+                        self._upload_immediate(
+                            labelled_bytes, unlabelled_bytes, detection,
+                            frame_index, frame_width, frame_height,
+                        )
+            except Exception as exc:
+                self._logger.error(
+                    "Upload worker error: %s", exc,
+                )
+            finally:
+                self._upload_queue.task_done()
+
+    def _compute_blur(self, frame) -> tuple:
+        """Return (is_blur, score) for `frame`; (False, 0.0) if unavailable.
+
+        Never raises: blur is advisory metadata, so a failure here must not cost
+        us the upload. Falls back to the not-blurred default and warns once.
+        """
+        if self._blur_detector is None or frame is None:
+            return False, 0.0
+        try:
+            is_blur, score = self._blur_detector.detect(frame)
+            return bool(is_blur), round(float(score), 2)
+        except Exception as exc:
+            if not self._warned_blur_error:
+                self._logger.warning(
+                    "Blur scoring failed, defaulting to blur=false: %s", exc,
+                )
+                self._warned_blur_error = True
+            return False, 0.0
+
+    def _render_labelled(self, frame_raw, detections, fps, detection_count):
+        """Build the labelled frame on the worker thread.
+
+        Copies the raw frame, draws bboxes via the visualizer, and stamps the
+        FPS / detection count overlays — the same output the streaming thread
+        used to produce inline. Falls back to the raw frame if no visualizer
+        was provided (preserves behaviour for callers that didn't pass one).
+        """
+        if self._visualizer is None:
+            return frame_raw
+        canvas = frame_raw.copy()
+        try:
+            self._visualizer.draw(canvas, detections, inplace=True)
+            count = detection_count if detection_count is not None else len(detections)
+            cv2.putText(
+                canvas,
+                f"Detections: {count}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                canvas,
+                f"FPS: {float(fps):.2f}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+        except Exception as exc:
+            self._logger.warning("Labelled render failed, using raw frame: %s", exc)
+            return frame_raw
+        return canvas
+
+    def _encode(self, frame, quality: int) -> Optional[bytes]:
+        try:
+            success, encoded = cv2.imencode(
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+        except Exception as exc:
+            self._logger.error("JPEG encode raised: %s", exc)
+            return None
+        if not success:
+            self._logger.error("JPEG encode failed")
+            return None
+        return encoded.tobytes()
+
+    def _wait_for_queue_drain(
+        self, timeout_sec: Optional[float] = None,
+    ) -> None:
+        if timeout_sec is None:
+            self._upload_queue.join()
+            return
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while self._upload_queue.unfinished_tasks > 0:
+            if time.monotonic() >= deadline:
+                self._logger.warning(
+                    "Upload queue drain timed out after %.1fs;"
+                    " pending=%s",
+                    timeout_sec,
+                    self._upload_queue.unfinished_tasks,
+                )
+                return
+            time.sleep(0.05)
+
+    def _flush_drop_log(self) -> None:
+        if self._dropped_jobs <= 0:
+            return
+        self._logger.warning(
+            "Upload queue dropped %s additional job(s)",
+            self._dropped_jobs,
+        )
+        self._dropped_jobs = 0
+
+    # ------------------------------------------------------------------
+    # Training upload methods
+    # ------------------------------------------------------------------
+
+    def _enqueue_training(
+        self,
+        frame_raw,
+        detections,
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        if self._closed:
+            return
+        try:
+            self._training_queue.put_nowait(
+                (frame_raw, [d.copy() for d in detections],
+                 frame_index, frame_width, frame_height),
+            )
+        except queue.Full:
+            self._training_dropped_jobs += 1
+            now = time.monotonic()
+            if now - self._training_last_drop_log_at >= 1.0:
+                self._logger.warning(
+                    "Training queue full (maxsize=%s); dropped %s job(s)",
+                    self._training_queue.maxsize,
+                    self._training_dropped_jobs,
+                )
+                self._training_dropped_jobs = 0
+                self._training_last_drop_log_at = now
+
+    def _training_worker_loop(self) -> None:
+        while True:
+            item = self._training_queue.get()
+            try:
+                if item is _QUEUE_STOP:
+                    return
+                frame_raw, detections, frame_index, fw, fh = item
+                image_bytes = self._encode(frame_raw, self._training_jpeg_quality)
+                if image_bytes is None:
+                    continue
+                for detection in detections:
+                    self._upload_training(
+                        image_bytes, detection, frame_index, fw, fh,
+                    )
+            except Exception as exc:
+                self._logger.error("Training upload worker error: %s", exc)
+            finally:
+                self._training_queue.task_done()
+
+    def _upload_training(
+        self,
+        image_bytes: bytes,
+        detection: Dict,
+        frame_index: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> None:
+        label = _normalize_label(detection.get("class_name"))
+        now = datetime.now(self._tz)
+        basename = _build_basename(label, frame_index, now)
+        prefix = TRAINING_DATA_S3_PREFIX
+
+        # 1. Upload raw image
+        img_key = f"{prefix}/images/{basename}.jpg"
+        url = self._s3.upload_bytes(image_bytes, img_key)
+        if not url:
+            self._logger.error("Training S3 upload failed (image) key=%s", img_key)
+            return
+
+        # 2. Upload YOLO label
+        resolved = _resolve_label(detection.get("class_name"))
+        if resolved:
+            _, class_id = resolved
+            yolo_line = _bbox_to_yolo_line(
+                detection.get("bbox"), class_id, frame_width, frame_height,
+            )
+            if yolo_line:
+                label_key = f"{prefix}/labels/{basename}.txt"
+                self._s3.upload_bytes(
+                    (yolo_line + "\n").encode("utf-8"),
+                    label_key,
+                    content_type="text/plain",
+                )
+
+        # 3. Upload metadata JSON. Includes GPS when a fix is available; otherwise
+        # falls back to the static LOCATION env var and marks gps_fix=False so
+        # consumers can filter training samples lacking real coordinates.
+        meta = {
+            "timestamp": now.isoformat(),
+            "label": label,
+            "confidence": detection.get("confidence", 0.0),
+            "bbox": detection.get("bbox"),
+            "frame_index": frame_index,
+        }
+        gps = detection.get("gps")
+        if (
+            isinstance(gps, dict)
+            and gps.get("lat") is not None
+            and gps.get("lon") is not None
+        ):
+            try:
+                lat = float(gps["lat"])
+                lon = float(gps["lon"])
+            except (TypeError, ValueError):
+                lat = lon = None
+            if lat is not None and lon is not None:
+                meta["gps"] = {"lat": lat, "lon": lon}
+                meta["location"] = f"{lat:.6f},{lon:.6f}"
+                meta["gps_fix"] = True
+            else:
+                meta["gps"] = None
+                meta["location"] = LOCATION or "unknown"
+                meta["gps_fix"] = False
+        else:
+            meta["gps"] = None
+            meta["location"] = LOCATION or "unknown"
+            meta["gps_fix"] = False
+        meta_key = f"{prefix}/metadata/{basename}.json"
+        self._s3.upload_bytes(
+            json.dumps(meta).encode("utf-8"),
+            meta_key,
+            content_type="application/json",
+        )
+        self._logger.info("Training upload complete label=%s key=%s", label, img_key)
+
+    def _wait_for_training_queue_drain(
+        self, timeout_sec: Optional[float] = None,
+    ) -> None:
+        if timeout_sec is None:
+            self._training_queue.join()
+            return
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while self._training_queue.unfinished_tasks > 0:
+            if time.monotonic() >= deadline:
+                self._logger.warning(
+                    "Training queue drain timed out after %.1fs; pending=%s",
+                    timeout_sec,
+                    self._training_queue.unfinished_tasks,
+                )
+                return
+            time.sleep(0.05)
+
+
+def _build_payload(label: str, image_url: str, detection: Dict) -> Dict:
+    location = _location_from_detection(detection) or LOCATION
+    return {
+        "did": str(_next_did()),
+        "type": DETECTION_TYPE,
+        "detect": label,
+        "image": image_url,
+        "location": location,
+        "confidence": round(float(detection.get("confidence", 0.0)), 2),
+        # Advisory rain-blur flag for dashboard filtering; defaults keep the
+        # payload well-formed when blur scoring is disabled or unavailable.
+        # Backend contract: `is_blurred` (bool) + `blur_score` as a STRING.
+        "is_blurred": bool(detection.get("blur", False)),
+        "blur_score": str(round(float(detection.get("blur_score", 0.0)), 2)),
+    }
+
+
+def _build_basename(label: str, frame_index: int, now: datetime) -> str:
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    suffix = now.microsecond
+    return f"{label}-frame{frame_index}-{timestamp}-{suffix}"
+
+
+def _build_key(label: str, frame_index: int, now: datetime) -> str:
+    return f"{_build_basename(label, frame_index, now)}.jpg"
+
+
+def _normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+
+def _location_from_detection(detection: Dict) -> Optional[str]:
+    gps = detection.get("gps")
+    if not gps:
+        return None
+
+    lat = None
+    lon = None
+    if isinstance(gps, dict):
+        lat = gps.get("lat")
+        lon = gps.get("lon")
+    elif isinstance(gps, (tuple, list)) and len(gps) == 2:
+        lat, lon = gps
+
+    if lat is None or lon is None:
+        return None
+
+    try:
+        return f"{float(lat):.6f},{float(lon):.6f}"
+    except (TypeError, ValueError):
+        return None
+
+====================================================================================================
+### [core-recorder-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/core/recorder/ffmpeg_recorder.py 2>&1
+----------------------------------------------------------------------------------------------------
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import signal
+import subprocess
+import time
+from typing import Optional, Sequence
+
+
+class FfmpegRecorder:
+    def __init__(
+        self,
+        rtsp_url: str,
+        output_path: Path,
+        ffmpeg_path: str = "ffmpeg",
+        extra_args: Optional[Sequence[str]] = None,
+        segment_seconds: int = 600,
+    ) -> None:
+        self.rtsp_url = rtsp_url
+        self.output_path = Path(output_path)
+        self.ffmpeg_path = ffmpeg_path
+        self.extra_args = list(extra_args or [])
+        self.segment_seconds = max(1, int(segment_seconds))
+        self._start_time = datetime.now()
+        self.log_path = self.output_path.parent / "ffmpeg_record.log"
+        self._process: Optional[subprocess.Popen] = None
+        self._log_handle: Optional[object] = None
+
+    def _build_output_pattern(self) -> str:
+        date_part = self._start_time.strftime("%Y%m%d")
+        time_part = self._start_time.strftime("%H%M%S")
+        suffix = self.output_path.suffix or ".mp4"
+        directory = self.output_path.parent
+        return str(directory / f"{date_part}_{time_part}_%d{suffix}")
+
+    @property
+    def output_pattern(self) -> str:
+        return self._build_output_pattern()
+
+    def _build_cmd(self) -> list[str]:
+        is_mp4 = self.output_path.suffix.lower() == ".mp4"
+        segment_format = (self.output_path.suffix.lstrip(".") or "mp4").lower()
+        output_pattern = self._build_output_pattern()
+        cmd = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rtsp_transport",
+            "tcp",
+            "-fflags",
+            "+genpts",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            self.rtsp_url,
+        ]
+        if self.extra_args:
+            cmd.extend(self.extra_args)
+        cmd.extend(
+            [
+                "-an",
+                "-c:v",
+                "copy",
+            ]
+        )
+        cmd.extend(
+            [
+                "-f",
+                "segment",
+                "-segment_time",
+                str(self.segment_seconds),
+                "-reset_timestamps",
+                "1",
+                "-start_number",
+                "1",
+                "-segment_format",
+                segment_format,
+            ]
+        )
+        cmd.extend(
+            [
+                "-y",
+                output_pattern,
+            ]
+        )
+        return cmd
+
+    def start(self) -> None:
+        if self.is_running():
+            return
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = self._build_cmd()
+        # Capture ffmpeg output to a log for easier debugging.
+        self._log_handle = open(self.log_path, "ab")
+        self._process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=self._log_handle,
+            stderr=self._log_handle,
+        )
+        # Fail fast if ffmpeg exits immediately (bad RTSP URL, unsupported flags, etc.).
+        time.sleep(0.8)
+        if self._process.poll() is not None:
+            code = self._process.returncode
+            self._close_log()
+            self._process = None
+            print(f"Recording failed to start (ffmpeg exit code {code}). See {self.log_path}")
+
+    def stop(self, timeout: float = 5.0) -> None:
+        if not self._process or self._process.poll() is not None:
+            self._close_log()
+            return
+        try:
+            self._process.send_signal(signal.SIGINT)
+        except Exception:
+            self._process.terminate()
+        try:
+            self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=timeout)
+        self._close_log()
+
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def _close_log(self) -> None:
+        try:
+            if self._log_handle:
+                self._log_handle.close()
+        finally:
+            self._log_handle = None
+
+====================================================================================================
+### [detection-filter-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/detection/filter.py 2>&1
+----------------------------------------------------------------------------------------------------
+"""Filter detections based on label allow-lists."""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, List, Optional
+
+from config.settings import (
+    EXCLUDED_UPLOAD_LABELS,
+    INTERESTING_LABELS,
+    MIN_CONFIDENCE,
+    POTHOLE_LABELS,
+    TRAINING_DATA_MIN_CONFIDENCE,
+)
+
+
+class LabelFilter:
+    """Filter detections to an allowed label set."""
+
+    def __init__(
+        self,
+        labels: Optional[Iterable[str]] = None,
+        min_confidence: Optional[float] = None,
+        excluded: Optional[Iterable[str]] = None,
+    ) -> None:
+        label_set = labels if labels is not None else INTERESTING_LABELS
+        self._labels = {normalize_label(label) for label in label_set if label}
+        self._min_confidence = min_confidence if min_confidence is not None else MIN_CONFIDENCE
+        excluded_set = excluded if excluded is not None else EXCLUDED_UPLOAD_LABELS
+        self._excluded = {normalize_label(label) for label in excluded_set if label}
+
+    def filter(self, detections: List[Dict]) -> List[Dict]:
+        out: List[Dict] = []
+        for detection in detections:
+            label = normalize_label(detection.get("class_name"))
+            # Detect-only helper classes (e.g. manhole_drain): never uploaded to
+            # the dashboard or S3 at any confidence. Checked before the allow-list
+            # so it wins even if the class is also in INTERESTING_LABELS.
+            if label in self._excluded:
+                continue
+            if label not in self._labels:
+                continue
+            # Potholes use the lower training floor so low-confidence ones can be
+            # promoted to the confirmed tier downstream.
+            floor = TRAINING_DATA_MIN_CONFIDENCE if label in POTHOLE_LABELS else self._min_confidence
+            if detection.get("confidence", 0.0) >= floor:
+                out.append(detection)
+        return out
+
+
+def normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+====================================================================================================
+### [detection-local-saver-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/detection/local_saver.py 2>&1
+----------------------------------------------------------------------------------------------------
+"""Local per-detection frame/label export helpers."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import logging
+from typing import Dict, Iterable, Optional, Tuple
+
+import cv2
+
+
+_CANONICAL_CLASS_IDS = {
+    "cracks": 0,
+    "potholes": 1,
+    "raveling": 2,
+    "stagnant_water": 3,
+}
+
+_LABEL_ALIASES = {
+    "cracks": "cracks",
+    "crack": "cracks",
+    "potholes": "potholes",
+    "pothole": "potholes",
+    "raveling": "raveling",
+    "stagnant_water": "stagnant_water",
+    "stagnant water": "stagnant_water",
+    "sw": "stagnant_water",
+}
+
+
+def _normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower().replace("_", " ")
+
+
+def _resolve_label(name: Optional[str]) -> Optional[Tuple[str, int]]:
+    normalized = _normalize_label(name)
+    canonical = _LABEL_ALIASES.get(normalized)
+    if not canonical:
+        return None
+    return canonical, _CANONICAL_CLASS_IDS[canonical]
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _bbox_to_yolo_line(
+    bbox: object, class_id: int, frame_width: int, frame_height: int
+) -> Optional[str]:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+
+    try:
+        x1, y1, x2, y2 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    except (TypeError, ValueError):
+        return None
+
+    left = _clamp(min(x1, x2), 0.0, float(frame_width))
+    right = _clamp(max(x1, x2), 0.0, float(frame_width))
+    top = _clamp(min(y1, y2), 0.0, float(frame_height))
+    bottom = _clamp(max(y1, y2), 0.0, float(frame_height))
+
+    box_w = right - left
+    box_h = bottom - top
+    if box_w <= 0.0 or box_h <= 0.0:
+        return None
+
+    x_center = _clamp(((left + right) / 2.0) / float(frame_width), 0.0, 1.0)
+    y_center = _clamp(((top + bottom) / 2.0) / float(frame_height), 0.0, 1.0)
+    width_n = _clamp(box_w / float(frame_width), 0.0, 1.0)
+    height_n = _clamp(box_h / float(frame_height), 0.0, 1.0)
+
+    return f"{class_id} {x_center:.6f} {y_center:.6f} {width_n:.6f} {height_n:.6f}"
+
+
+class LocalDetectionSaver:
+    """Save full-frame JPEG + YOLO TXT for each supported detection."""
+
+    def __init__(
+        self,
+        root_dir: Path,
+        logger: Optional[logging.Logger] = None,
+        jpeg_quality: int = 85,
+    ) -> None:
+        self.root_dir = Path(root_dir)
+        self.logger = logger or logging.getLogger(__name__)
+        self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
+        self._basename_counters: Dict[str, int] = {}
+        self._ensure_directories()
+
+    def _ensure_directories(self) -> None:
+        (self.root_dir / "images").mkdir(parents=True, exist_ok=True)
+        (self.root_dir / "labels").mkdir(parents=True, exist_ok=True)
+
+    def save_detection(
+        self,
+        frame_bgr,
+        detection: Dict,
+        timestamp: Optional[str] = None,
+    ) -> bool:
+        if frame_bgr is None:
+            return False
+        if getattr(frame_bgr, "shape", None) is None or len(frame_bgr.shape) < 2:
+            self.logger.warning("Local save skipped: invalid frame shape")
+            return False
+
+        frame_height = int(frame_bgr.shape[0])
+        frame_width = int(frame_bgr.shape[1])
+        if frame_width <= 0 or frame_height <= 0:
+            self.logger.warning("Local save skipped: non-positive frame size")
+            return False
+
+        resolved = _resolve_label(detection.get("class_name"))
+        if not resolved:
+            return False
+        _class_name, class_id = resolved
+
+        line = _bbox_to_yolo_line(
+            detection.get("bbox"),
+            class_id=class_id,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if not line:
+            return False
+
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+
+        image_dir = self.root_dir / "images"
+        label_dir = self.root_dir / "labels"
+        base_name = self._allocate_basename(timestamp)
+
+        image_path = image_dir / f"{base_name}.jpg"
+        label_path = label_dir / f"{base_name}.txt"
+
+        if not cv2.imwrite(
+            str(image_path),
+            frame_bgr,
+            [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality],
+        ):
+            self.logger.error("Failed to write image: %s", image_path)
+            return False
+        label_path.write_text(f"{line}\n", encoding="utf-8")
+        return True
+
+    def save_frame_detections(self, frame_bgr, detections: Iterable[Dict]) -> int:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        saved_count = 0
+        for detection in detections:
+            if self.save_detection(frame_bgr, detection, timestamp=timestamp):
+                saved_count += 1
+        return saved_count
+
+    def _allocate_basename(self, timestamp: str) -> str:
+        index = self._basename_counters.get(timestamp, 0)
+        suffix = "" if index == 0 else f"-{index:02d}"
+        candidate = f"{timestamp}{suffix}"
+        self._basename_counters[timestamp] = index + 1
+        return candidate
+
+====================================================================================================
+### [detection-local-save-pipeline-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/detection/local_save_pipeline.py 2>&1
+----------------------------------------------------------------------------------------------------
+"""Local detection save orchestration with class-based routing."""
+
+from __future__ import annotations
+
+import queue
+import threading
+import time
+from typing import Dict, Iterable, Optional, Sequence
+
+from config.settings import CRACK_LABELS, CRACK_UPLOAD_DELAY, IMMEDIATE_UPLOAD_LABELS
+from detection.local_saver import LocalDetectionSaver
+from upload.batcher import CrackDebouncer
+from upload.deduplicator import TrackDeduplicator
+
+
+_QUEUE_STOP = object()
+
+
+def _normalize_label(name: Optional[str]) -> str:
+    return (name or "").strip().lower()
+
+
+class LocalSavePipeline:
+    """Apply upload-like class strategy to local detection saves."""
+
+    def __init__(
+        self,
+        saver: LocalDetectionSaver,
+        logger,
+        dedup_size: int = 5000,
+        save_queue_size: int = 32,
+        crack_delay_seconds: Optional[float] = None,
+        crack_labels: Optional[Sequence[str]] = None,
+        immediate_labels: Optional[Sequence[str]] = None,
+    ) -> None:
+        self._saver = saver
+        self._logger = logger
+        self._deduplicator = TrackDeduplicator(dedup_size)
+        self._save_queue: queue.Queue = queue.Queue(maxsize=max(1, int(save_queue_size)))
+        self._dropped_jobs = 0
+        self._last_drop_log_at = 0.0
+        self._closed = False
+        self._crack_labels = {
+            _normalize_label(label)
+            for label in (crack_labels if crack_labels is not None else CRACK_LABELS)
+            if label
+        }
+        self._immediate_labels = {
+            _normalize_label(label)
+            for label in (
+                immediate_labels if immediate_labels is not None else IMMEDIATE_UPLOAD_LABELS
+            )
+            if label
+        }
+        delay = (
+            CRACK_UPLOAD_DELAY
+            if crack_delay_seconds is None
+            else max(0.0, float(crack_delay_seconds))
+        )
+        self._crack_debouncer = CrackDebouncer(delay, self._save_crack)
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="local-save-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def process_frame(
+        self,
+        frame_bgr,
+        detections: Iterable[Dict],
+    ) -> None:
+        detections = list(detections)
+        if not detections:
+            return
+
+        cracks = []
+        immediate = []
+        for detection in detections:
+            label = _normalize_label(detection.get("class_name"))
+            if label in self._crack_labels:
+                cracks.append(detection)
+            elif label in self._immediate_labels:
+                immediate.append(detection)
+
+        for detection in immediate:
+            if not self._deduplicator.should_upload(detection):
+                self._logger.debug(
+                    "Local save skipped (dedup) label=%s track_id=%s",
+                    _normalize_label(detection.get("class_name")),
+                    detection.get("track_id"),
+                )
+                continue
+            self._enqueue_save(frame_bgr, detection)
+
+        if cracks:
+            # Local save only needs one frame; debouncer signature carries two
+            # to align with the upload pipeline (labelled + unlabelled).
+            self._crack_debouncer.schedule(frame_bgr, None, cracks[-1])
+
+    def flush(self, timeout_sec: Optional[float] = None) -> None:
+        self._crack_debouncer.flush()
+        self._wait_for_queue_drain(timeout_sec=timeout_sec)
+        self._flush_drop_log()
+
+    def _save_crack(self, frame_bgr, _unused, detection: Dict) -> None:
+        self._enqueue_save(frame_bgr, detection)
+
+    def close(self, timeout_sec: float = 10.0) -> None:
+        if self._closed:
+            return
+        self.flush(timeout_sec=timeout_sec)
+        self._closed = True
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            try:
+                self._save_queue.put(_QUEUE_STOP, timeout=0.1)
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    self._logger.warning(
+                        "Local save worker stop timed out while queue remained full"
+                    )
+                    return
+        self._worker.join(timeout=max(0.0, float(timeout_sec)))
+        if self._worker.is_alive():
+            self._logger.warning(
+                "Local save worker did not stop within %.1fs", timeout_sec
+            )
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._save_queue.get()
+            try:
+                if item is _QUEUE_STOP:
+                    return
+                frame_bgr, detection = item
+                self._saver.save_detection(frame_bgr, detection)
+            except Exception as exc:
+                self._logger.error("Local async save failed: %s", exc)
+            finally:
+                self._save_queue.task_done()
+
+    def _enqueue_save(self, frame_bgr, detection: Dict) -> None:
+        if self._closed:
+            return
+        try:
+            self._save_queue.put_nowait((frame_bgr, detection.copy()))
+        except queue.Full:
+            self._dropped_jobs += 1
+            now = time.monotonic()
+            if now - self._last_drop_log_at >= 1.0:
+                self._logger.warning(
+                    "Local save queue full (maxsize=%s); dropped %s job(s)",
+                    self._save_queue.maxsize,
+                    self._dropped_jobs,
+                )
+                self._dropped_jobs = 0
+                self._last_drop_log_at = now
+
+    def _wait_for_queue_drain(self, timeout_sec: Optional[float]) -> None:
+        if timeout_sec is None:
+            self._save_queue.join()
+            return
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while self._save_queue.unfinished_tasks > 0:
+            if time.monotonic() >= deadline:
+                self._logger.warning(
+                    "Local save queue drain timed out after %.1fs; pending=%s",
+                    timeout_sec,
+                    self._save_queue.unfinished_tasks,
+                )
+                return
+            time.sleep(0.05)
+
+    def _flush_drop_log(self) -> None:
+        if self._dropped_jobs <= 0:
+            return
+        self._logger.warning(
+            "Local save queue dropped %s additional job(s)", self._dropped_jobs
+        )
+        self._dropped_jobs = 0
+
+====================================================================================================
+### [detection-visualizer-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/detection/visualizer.py 2>&1
+----------------------------------------------------------------------------------------------------
+"""Draw detection bounding boxes onto frames."""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable
+
+
+import cv2
+
+
+class FrameVisualizer:
+    """Render bounding boxes onto frames."""
+
+    def draw(self, frame, detections: Iterable[Dict], inplace: bool = True):
+        canvas = frame if inplace else frame.copy()
+        for detection in detections:
+            self.draw_detection(canvas, detection)
+        return canvas
+
+    def draw_detection(self, frame, detection: Dict) -> None:
+        bbox = detection.get("bbox")
+        if not bbox or len(bbox) != 4:
+            return
+        x1, y1, x2, y2 = [int(b) for b in bbox]
+        x1 = max(0, min(frame.shape[1] - 1, x1))
+        y1 = max(0, min(frame.shape[0] - 1, y1))
+        x2 = max(0, min(frame.shape[1] - 1, x2))
+        y2 = max(0, min(frame.shape[0] - 1, y2))
+        color = (0, 255, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+====================================================================================================
+### [detection-blur-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/detection/blur.py 2>&1
+----------------------------------------------------------------------------------------------------
+"""Blur (sharpness) scoring on the road region of a frame.
+
+Soft-flag only: the score is attached to upload payloads so the dashboard can
+filter rain-blurred false positives. Nothing here drops or alters detections.
+
+v1 is a classical variance-of-Laplacian measure. A learned v2 can be added by
+subclassing `BlurDetector` and registering it under a new method name -- call
+sites resolve the implementation through `create_blur_detector`, so they do not
+change.
+"""
+
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
+
+import cv2
+
+_module_logger = logging.getLogger(__name__)
+
+# Fractional (x0, y0, x1, y1) bounds of the frame to score.
+Roi = Tuple[float, float, float, float]
+
+FULL_FRAME_ROI: Roi = (0.0, 0.0, 1.0, 1.0)
+
+
+@dataclass(frozen=True)
+class BlurResult:
+    is_blur: bool
+    score: float
+
+
+def crop_to_roi(frame, roi: Roi):
+    """Return the ROI sub-image, or the whole frame if the ROI is degenerate.
+
+    Bounds are fractions of the frame so a single config value works across
+    camera resolutions.
+    """
+    height, width = frame.shape[:2]
+    x0f, y0f, x1f, y1f = roi
+    x0 = max(0, min(width, int(round(x0f * width))))
+    x1 = max(0, min(width, int(round(x1f * width))))
+    y0 = max(0, min(height, int(round(y0f * height))))
+    y1 = max(0, min(height, int(round(y1f * height))))
+    if x1 <= x0 or y1 <= y0:
+        return frame
+    return frame[y0:y1, x0:x1]
+
+
+class BlurDetector(ABC):
+    """Scores a frame's sharpness and applies a threshold."""
+
+    @abstractmethod
+    def detect(self, frame) -> Tuple[bool, float]:
+        """Return (is_blur, score). Higher score means sharper."""
+
+
+class LaplacianBlurDetector(BlurDetector):
+    """Variance of the Laplacian over the road ROI.
+
+    The score is not scale-free -- it shifts with resolution, lighting and road
+    texture -- so `threshold` must be calibrated per camera against real
+    footage (see `utils/calibrate_blur.py`).
+    """
+
+    def __init__(self, threshold: float, roi: Roi = FULL_FRAME_ROI) -> None:
+        self._threshold = float(threshold)
+        self._roi = roi
+
+    def detect(self, frame) -> Tuple[bool, float]:
+        region = crop_to_roi(frame, self._roi)
+        if region.ndim == 3:
+            region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        score = float(cv2.Laplacian(region, cv2.CV_64F).var())
+        return score < self._threshold, score
+
+
+_REGISTRY: Dict[str, Callable[[float, Roi], BlurDetector]] = {
+    "laplacian": LaplacianBlurDetector,
+}
+
+
+def register_blur_detector(
+    method: str, factory: Callable[[float, Roi], BlurDetector],
+) -> None:
+    """Register an implementation under `method` for BLUR_METHOD to select."""
+    _REGISTRY[method.strip().lower()] = factory
+
+
+def create_blur_detector(
+    method: str,
+    threshold: float,
+    roi: Roi = FULL_FRAME_ROI,
+    logger: Optional[logging.Logger] = None,
+) -> BlurDetector:
+    """Build the detector named by `method`, falling back to laplacian."""
+    log = logger or _module_logger
+    key = (method or "").strip().lower()
+    factory = _REGISTRY.get(key)
+    if factory is None:
+        log.warning(
+            "Unknown BLUR_METHOD=%r; falling back to laplacian (known=%s)",
+            method,
+            ",".join(sorted(_REGISTRY)),
+        )
+        factory = LaplacianBlurDetector
+    return factory(threshold, roi)
+
+====================================================================================================
+### [robolyze-detection-app-py]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/basic_pipelines/robolyze_detection_app.py 2>&1
+----------------------------------------------------------------------------------------------------
+import os
+import re
+import sys
+from urllib.parse import urlparse, urlunparse, unquote
+
+import cv2
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst, GLib
+
+from hailo_apps.hailo_app_python.apps.detection.detection_pipeline import (
+    GStreamerDetectionApp as _HailoGStreamerDetectionApp,
+)
+from hailo_apps.hailo_app_python.core.common.buffer_utils import (
+    get_caps_from_pad,
+    get_numpy_from_buffer,
+)
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import disable_qos
+from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines import (
+    DISPLAY_PIPELINE,
+    INFERENCE_PIPELINE,
+    INFERENCE_PIPELINE_WRAPPER,
+    OVERLAY_PIPELINE,
+    QUEUE,
+    SOURCE_PIPELINE,
+    TRACKER_PIPELINE,
+    USER_CALLBACK_PIPELINE,
+)
+
+
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "off"}
+_UI_PREVIEW_IDENTITY_NAME = "ui_preview_callback"
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return default
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except Exception:
+        return default
+
+
+def _gst_escape(value: str) -> str:
+    # Minimal escaping for Gst.parse_launch() launch syntax.
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _redact_pipeline(pipeline: str) -> str:
+    return re.sub(r'user-pw="(?:\\.|[^"])*"', 'user-pw="***"', pipeline)
+
+
+def _ui_display_pipeline(
+    *,
+    video_sink: str,
+    sync: str,
+    show_fps: str,
+    name: str = "hailo_display",
+) -> str:
+    # Build a display branch identical to DISPLAY_PIPELINE but with a probe tap after hailooverlay.
+    return (
+        f'{OVERLAY_PIPELINE(name=f"{name}_overlay")} ! '
+        f'{QUEUE(name=f"{name}_videoconvert_q")} ! '
+        f"videoconvert name={name}_videoconvert n-threads=2 qos=false ! "
+        f'{QUEUE(name=f"{name}_rgb_q")} ! '
+        "video/x-raw, format=RGB ! "
+        f'{QUEUE(name=f"{name}_ui_tap_q")} ! '
+        f"identity name={_UI_PREVIEW_IDENTITY_NAME} ! "
+        f'{QUEUE(name=f"{name}_q")} ! '
+        f"fpsdisplaysink name={name} video-sink={video_sink} sync={sync} text-overlay={show_fps} signal-fps-measurements=true "
+    )
+
+
+def _rtsp_source_pipeline(
+    *,
+    video_source: str,
+    video_width: int,
+    video_height: int,
+    name: str,
+    frame_rate: int,
+    sync=True,
+    video_format: str = "RGB",
+) -> str:
+    parsed = urlparse(video_source)
+
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+
+    # Optional overrides that avoid URL encoding edge-cases (e.g. '@' in passwords).
+    username = os.getenv("RTSP_USERNAME") or os.getenv("RTSP_USER") or username
+    password = os.getenv("RTSP_PASSWORD") or os.getenv("RTSP_PASS") or password
+
+    # Strip credentials from the location; rtspsrc gets auth via user-id/user-pw.
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    clean_location = urlunparse(
+        (
+            parsed.scheme or "rtsp",
+            netloc,
+            parsed.path or "",
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+    auth_props = ""
+    if username or password:
+        auth_props = f' user-id="{_gst_escape(username)}" user-pw="{_gst_escape(password)}"'
+
+    source_element = (
+        f'rtspsrc location="{_gst_escape(clean_location)}"{auth_props} '
+        f"protocols=tcp latency=300 do-rtsp-keep-alive=true timeout=10000000 name={name} ! "
+        f"rtph264depay ! "
+        f"h264parse ! "
+        f"avdec_h264 ! "
+    )
+
+    if sync:
+        fps_caps = f"video/x-raw, framerate={frame_rate}/1"
+    else:
+        fps_caps = "video/x-raw"
+
+    source_pipeline = (
+        f"{source_element} "
+        f'{QUEUE(name=f"{name}_scale_q")} ! '
+        f"videoscale name={name}_videoscale n-threads=2 ! "
+        f'{QUEUE(name=f"{name}_convert_q")} ! '
+        f"videoconvert n-threads=3 name={name}_convert qos=false ! "
+        f"video/x-raw, pixel-aspect-ratio=1/1, format={video_format}, "
+        f"width={video_width}, height={video_height} ! "
+        f"videorate name={name}_videorate ! capsfilter name={name}_fps_caps caps=\"{fps_caps}\" "
+    )
+
+    return source_pipeline
+
+
+class RobolyzeDetectionApp(_HailoGStreamerDetectionApp):
+    """
+    Wrapper around Hailo's detection app that:
+    - Percent-decodes RTSP username/password safely.
+    - Avoids printing plaintext RTSP passwords in the pipeline string.
+    - Stops reconnect loops on 401 Unauthorized (prevents segfaults on tight restart loops).
+    """
+
+    def __init__(self, app_callback, user_data, parser=None, combined_ui_mode: bool = False):
+        self._rtsp_restart_pending = False
+        self._combined_ui_mode = bool(combined_ui_mode)
+        self._ui_preview_probe_attached = False
+        super().__init__(app_callback, user_data, parser=parser)
+
+    def get_pipeline_string(self):
+        self.video_width  = _parse_int_env("VIDEO_WIDTH",  1920)
+        self.video_height = _parse_int_env("VIDEO_HEIGHT", 1080)
+        multi_process_service = _parse_bool_env("HAILO_MULTI_PROCESS_SERVICE", True)
+        vdevice_group_id = _parse_int_env("HAILO_VDEVICE_GROUP_ID", 1)
+
+        if self.source_type == "rtsp":
+            source_pipeline = _rtsp_source_pipeline(
+                video_source=self.video_source,
+                video_width=self.video_width,
+                video_height=self.video_height,
+                name="source",
+                frame_rate=self.frame_rate,
+                sync=self.sync,
+                video_format=self.video_format,
+            )
+        else:
+            source_pipeline = SOURCE_PIPELINE(
+                video_source=self.video_source,
+                video_width=self.video_width,
+                video_height=self.video_height,
+                frame_rate=self.frame_rate,
+                sync=self.sync,
+            )
+
+        detection_pipeline = INFERENCE_PIPELINE(
+            hef_path=self.hef_path,
+            post_process_so=self.post_process_so,
+            post_function_name=self.post_function_name,
+            batch_size=self.batch_size,
+            config_json=self.labels_json,
+            additional_params=self.thresholds_str,
+            multi_process_service=multi_process_service,
+            vdevice_group_id=vdevice_group_id,
+        )
+        detection_pipeline_wrapper = INFERENCE_PIPELINE_WRAPPER(detection_pipeline)
+        tracker_pipeline = TRACKER_PIPELINE(class_id=-1)
+        user_callback_pipeline = USER_CALLBACK_PIPELINE()
+        video_sink = "fakesink" if self._combined_ui_mode else self.video_sink
+        # Always disable fpsdisplaysink's text overlay — it measures render-sink
+        # arrival rate which is highly unstable (can read 1000+ or <10 at random).
+        # End-to-end pipeline FPS is computed in the user callback and drawn via cv2.
+        if self._combined_ui_mode:
+            display_pipeline = _ui_display_pipeline(
+                video_sink=video_sink, sync=self.sync, show_fps="false"
+            )
+        else:
+            display_pipeline = DISPLAY_PIPELINE(
+                video_sink=video_sink, sync=self.sync, show_fps="false"
+            )
+
+        pipeline_string = (
+            f"{source_pipeline} ! "
+            f"{detection_pipeline_wrapper} ! "
+            f"{tracker_pipeline} ! "
+            f"{user_callback_pipeline} ! "
+            f"{display_pipeline}"
+        )
+        print(_redact_pipeline(pipeline_string))
+        return pipeline_string
+
+    def create_pipeline(self):
+        # Same as upstream, but avoid replacing the running main loop on restarts.
+        Gst.init(None)
+
+        pipeline_string = self.get_pipeline_string()
+        try:
+            self.pipeline = Gst.parse_launch(pipeline_string)
+        except Exception as e:
+            print(f"Error creating pipeline: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Do not connect fpsdisplaysink's fps-measurements signal — its values
+        # are the render-sink arrival rate and are unreliable (often 1000+).
+        # End-to-end FPS is computed via the user callback sliding window instead.
+        self._attach_ui_preview_probe()
+
+        if self.loop is None:
+            self.loop = GLib.MainLoop()
+
+    def _attach_ui_preview_probe(self) -> None:
+        self._ui_preview_probe_attached = False
+        if not self._combined_ui_mode:
+            return
+        identity = self.pipeline.get_by_name(_UI_PREVIEW_IDENTITY_NAME)
+        if identity is None:
+            print(
+                "Warning: UI preview callback element not found; UI may not match non-UI display.",
+                file=sys.stderr,
+            )
+            return
+        identity_pad = identity.get_static_pad("src")
+        if identity_pad is None:
+            print(
+                "Warning: UI preview callback pad not found; UI may not match non-UI display.",
+                file=sys.stderr,
+            )
+            return
+        identity_pad.add_probe(
+            Gst.PadProbeType.BUFFER, self._ui_preview_probe, None
+        )
+        self._ui_preview_probe_attached = True
+
+    @staticmethod
+    def _to_bgr_frame(frame, pixel_format: str):
+        fmt = (pixel_format or "").upper()
+        try:
+            if isinstance(frame, tuple):
+                if len(frame) == 2:
+                    y_plane, uv_plane = frame
+                    return cv2.cvtColorTwoPlane(
+                        y_plane, uv_plane, cv2.COLOR_YUV2BGR_NV12
+                    )
+                return None
+            if not hasattr(frame, "shape"):
+                return None
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                if fmt == "BGR":
+                    return frame.copy()
+                return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if len(frame.shape) == 3 and frame.shape[2] == 2 and fmt == "YUYV":
+                return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUY2)
+        except Exception:
+            return None
+        return None
+
+    def _ui_preview_probe(self, pad, info, _user_data):
+        if not self._combined_ui_mode:
+            return Gst.PadProbeReturn.OK
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        pixel_format, width, height = get_caps_from_pad(pad)
+        if pixel_format is None or width is None or height is None:
+            return Gst.PadProbeReturn.OK
+        try:
+            frame = get_numpy_from_buffer(buffer, pixel_format, width, height)
+        except Exception:
+            return Gst.PadProbeReturn.OK
+        # The pipeline caps force format=RGB before the identity tap,
+        # so pass the frame directly to avoid an unnecessary RGB->BGR->RGB
+        # round-trip (the UI would convert it right back).
+        fmt = (pixel_format or "").upper()
+        if fmt == "RGB" and hasattr(frame, "shape") and len(frame.shape) == 3:
+            frame_out = frame.copy()
+        else:
+            frame_out = self._to_bgr_frame(frame, pixel_format)
+        if frame_out is None:
+            return Gst.PadProbeReturn.OK
+        try:
+            fps = getattr(self.user_data, "fps", 0.0)
+            cv2.putText(
+                frame_out,
+                f"FPS: {fps:.2f}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+        except Exception:
+            pass
+        try:
+            self.user_data.set_frame(frame_out)
+        except Exception:
+            pass
+        return Gst.PadProbeReturn.OK
+
+    def bus_call(self, bus, message, loop):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("End-of-stream")
+            self.on_eos()
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            debug_str = debug or ""
+            err_str = str(err)
+            print(f"Error: {err}, {debug}", file=sys.stderr)
+
+            if self.source_type == "rtsp":
+                # Never recovers on bad credentials; also avoids tight restart loops that can segfault.
+                if "Unauthorized" in err_str or "401" in debug_str:
+                    print(
+                        "RTSP Unauthorized (401). Check username/password and the RTSP URL.",
+                        file=sys.stderr,
+                    )
+                    self.error_occurred = True
+                    self.shutdown()
+                    return True
+
+                if self._rtsp_restart_pending:
+                    return True
+
+                if self.restart_attempts < self.max_restarts:
+                    self.restart_attempts += 1
+                    self._rtsp_restart_pending = True
+                    print(
+                        f"Attempting RTSP reconnect {self.restart_attempts}/{self.max_restarts} ..."
+                    )
+                    GLib.idle_add(self.handle_rtsp_error)
+                else:
+                    self.error_occurred = True
+                    self.shutdown()
+            else:
+                self.error_occurred = True
+                self.shutdown()
+        elif t == Gst.MessageType.QOS:
+            if not hasattr(self, "qos_count"):
+                self.qos_count = 0
+            self.qos_count += 1
+            if self.qos_count > 50 and self.qos_count % 10 == 0:
+                qos_element = message.src.get_name()
+                print(f"\033[91mQoS message received from {qos_element}\033[0m")
+                print(
+                    f"\033[91mLots of QoS messages received: {self.qos_count}, consider optimizing the pipeline "
+                    "or reducing the pipeline frame rate see '--frame-rate' flag.\033[0m"
+                )
+
+        return True
+
+    def handle_rtsp_error(self):
+        try:
+            self.pipeline.set_state(Gst.State.NULL)
+            GLib.usleep(200000)
+            self.create_pipeline()
+
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self.bus_call, self.loop)
+
+            if not self.options_menu.disable_callback:
+                identity = self.pipeline.get_by_name("identity_callback")
+                if identity:
+                    identity_pad = identity.get_static_pad("src")
+                    identity_pad.add_probe(
+                        Gst.PadProbeType.BUFFER, self.app_callback, self.user_data
+                    )
+
+            disable_qos(self.pipeline)
+
+            self.pipeline.set_state(Gst.State.PAUSED)
+            new_latency = self.pipeline_latency * Gst.MSECOND
+            self.pipeline.set_latency(new_latency)
+            self.pipeline.set_state(Gst.State.PLAYING)
+            print("RTSP pipeline restarted.")
+        except Exception as e:
+            print(f"Failed to restart RTSP pipeline: {e}", file=sys.stderr)
+            self.error_occurred = True
+            self.shutdown()
+        finally:
+            self._rtsp_restart_pending = False
+
+    def request_shutdown(self):
+        try:
+            if self.loop is not None and self.loop.is_running():
+                GLib.idle_add(self.shutdown)
+            else:
+                self.shutdown()
+        except Exception:
+            self.shutdown()
+
+====================================================================================================
+### [tests-dir-ls]
+CMD: find ~/miniproj_epan/hailo-rpi5-examples/tests -maxdepth 2 2>&1
+----------------------------------------------------------------------------------------------------
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_local_save_pipeline.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_hailo_rpi5_examples.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_blur_detection.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_local_detection_saver.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_routing.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_regression.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_settings_storage_fallback.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_gps.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_blur_detection.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_hailo_rpi5_examples.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_local_detection_saver.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_local_save_pipeline.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_settings_storage_fallback.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_camera.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_local_detection_saver.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_dual_tier_upload.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/__pycache__/test_camera.cpython-311-pytest-7.2.1.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/archive
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/archive/archived_test_advanced.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/archive/archived_test_infra.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/archive/archived_test_sanity_check.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/archive/archived_test_edge_cases.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_aws_upload_folder_structure.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_regression.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_gps.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_settings_storage_fallback.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_resources
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_resources/requirements.txt
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_resources/dummy_text.txt
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_camera.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_routing.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/tests/test_dual_tier_upload.py
+
+====================================================================================================
+### [run-tests-sh]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/run_tests.sh 2>&1
+----------------------------------------------------------------------------------------------------
+#!/bin/bash
+
+# Path to your setup_env.sh file
+SETUP_ENV_PATH="setup_env.sh"
+
+# Path to your tests directory
+TESTS_DIR="tests"
+
+# Source the setup_env.sh file (it will handle virtual environment activation)
+echo "Sourcing setup_env.sh..."
+source "$SETUP_ENV_PATH"
+
+# Install pytest requirements if not already installed
+pip install -r tests/test_resources/requirements.txt
+
+# Download all HEFs
+hailo-download-resources --group all
+
+# Run pytest for all test files
+echo "Running tests..."
+# pytest --log-cli-level=INFO \
+#        #"$TESTS_DIR/test_sanity_check.py" \
+#        "$TESTS_DIR/test_hailo_rpi5_examples.py" \
+#        #"$TESTS_DIR/test_edge_cases.py" \
+#        #"$TESTS_DIR/test_advanced.py" \
+#        #"$TESTS_DIR/test_infra.py"
+
+pytest -s "$TESTS_DIR"/test_hailo_rpi5_examples.py
+
+echo "All tests completed."
+
+====================================================================================================
+### [system-test-run-sh]
+CMD: cat ~/miniproj_epan/hailo-rpi5-examples/system_test_run.sh 2>&1
+----------------------------------------------------------------------------------------------------
+#!/usr/bin/env bash
+# system_test_run.sh — quick system check then launch (no speed gate)
+# Checks: internet, camera TCP, GPS device, Hailo device — then starts pipeline.
+set -eo pipefail
+
+APP_DIR="/home/rasp/miniproj_epan/hailo-rpi5-examples"
+CAMERA_URL="rtsp://192.168.0.126/live/mainstream"
+INTERNET_CHECK_HOST="8.8.8.8"
+GPS_PORT="${GPS_PORT:-/dev/ttyACM0}"
+HAILO_DEVICE="/dev/hailo0"
+
+export DISPLAY="${DISPLAY:-:0}"
+
+PASS=0
+FAIL=0
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+check_pass() { log "  [PASS] $*"; PASS=$((PASS + 1)); }
+check_fail() { log "  [FAIL] $*"; FAIL=$((FAIL + 1)); }
+
+log "========================================"
+log "  System pre-flight check"
+log "========================================"
+
+# ---------------------------------------------------------------------------
+# 1 — Internet
+# ---------------------------------------------------------------------------
+log "Checking internet (${INTERNET_CHECK_HOST})..."
+if ping -c 1 -W 3 "$INTERNET_CHECK_HOST" &>/dev/null; then
+    check_pass "Internet reachable"
+else
+    check_fail "No internet (${INTERNET_CHECK_HOST} unreachable)"
+fi
+
+# ---------------------------------------------------------------------------
+# 2 — RTSP camera (TCP probe)
+# ---------------------------------------------------------------------------
+CAMERA_HOST=$(echo "$CAMERA_URL" | sed -E 's|rtsp://([^/:]+).*|\1|')
+CAMERA_PORT=$(echo "$CAMERA_URL" | sed -E 's|rtsp://[^/:]+:([0-9]+).*|\1|')
+[[ "$CAMERA_PORT" =~ ^[0-9]+$ ]] || CAMERA_PORT=554
+
+log "Checking camera at ${CAMERA_HOST}:${CAMERA_PORT}..."
+if nc -z -w 3 "$CAMERA_HOST" "$CAMERA_PORT" &>/dev/null; then
+    check_pass "Camera reachable (${CAMERA_HOST}:${CAMERA_PORT})"
+else
+    check_fail "Camera not reachable (${CAMERA_HOST}:${CAMERA_PORT})"
+fi
+
+# ---------------------------------------------------------------------------
+# 3 — GPS device present
+# ---------------------------------------------------------------------------
+log "Checking GPS device (${GPS_PORT})..."
+if [ -e "$GPS_PORT" ]; then
+    check_pass "GPS device present (${GPS_PORT})"
+else
+    check_fail "GPS device not found (${GPS_PORT})"
+fi
+
+# ---------------------------------------------------------------------------
+# 4 — Hailo device
+# ---------------------------------------------------------------------------
+log "Checking Hailo device (${HAILO_DEVICE})..."
+if [ -e "$HAILO_DEVICE" ]; then
+    check_pass "Hailo device present (${HAILO_DEVICE})"
+else
+    check_fail "Hailo device not found (${HAILO_DEVICE})"
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+log "========================================"
+log "  Results: ${PASS} passed, ${FAIL} failed"
+log "========================================"
+
+if [ "$FAIL" -gt 0 ]; then
+    log "WARNING: ${FAIL} check(s) failed — launching anyway."
+fi
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
+cd "$APP_DIR"
+source "$APP_DIR/setup_env.sh"
+
+log "Launching detection pipeline."
+exec python basic_pipelines/detection.py \
+    --input "$CAMERA_URL" \
+    --hef-path "$APP_DIR/yolov11n_dataset9-9.hef" \
+    --labels-json "$APP_DIR/labels.json" \
+    --show-fps
+
+====================================================================================================
+### [logs-test-ls]
+CMD: ls -la ~/miniproj_epan/hailo-rpi5-examples/logs_test/ 2>&1 | head -20
+----------------------------------------------------------------------------------------------------
+total 16
+drwxr-xr-x  2 rasp rasp 4096 Feb  6 14:59 .
+drwxr-xr-x 23 rasp rasp 4096 Jul 27 15:45 ..
+-rw-r--r--  1 rasp rasp    0 Feb  6 14:56 edge_20260206_145645.log
+-rw-r--r--  1 rasp rasp  672 Feb  6 14:57 edge_20260206_145732.log
+-rw-r--r--  1 rasp rasp  354 Feb  6 17:15 edge_20260206_145952.log
+
+====================================================================================================
+### [videos-ls]
+CMD: ls -la ~/miniproj_epan/hailo-rpi5-examples/videos/ 2>&1 | head -20
+----------------------------------------------------------------------------------------------------
+total 8
+drwxr-xr-x  2 rasp rasp 4096 Feb 18 13:10 .
+drwxr-xr-x 23 rasp rasp 4096 Jul 27 15:45 ..
+
+====================================================================================================
+### [upload-dir-ls]
+CMD: find ~/miniproj_epan/hailo-rpi5-examples/upload -maxdepth 2 2>&1
+----------------------------------------------------------------------------------------------------
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__init__.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/s3_uploader.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/batcher.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/deduplicator.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/__init__.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/s3_uploader.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/api_client.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/deduplicator.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/batcher.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/__pycache__/pipeline.cpython-311.pyc
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/api_client.py
+/home/rasp/miniproj_epan/hailo-rpi5-examples/upload/pipeline.py
+
+====================================================================================================
+### [recent-runtime-log-tail]
+CMD: tail -n 80 $(ls -t ~/miniproj_epan/hailo-rpi5-examples/logs/runtime_*.log 2>/dev/null | head -1) 2>&1
+----------------------------------------------------------------------------------------------------
+2026-07-27 15:50:56,695 [INFO] Frame heartbeat frame=11170 fps=29.62
+2026-07-27 15:51:01,744 [INFO] Frame heartbeat frame=11320 fps=29.49
+2026-07-27 15:51:06,773 [INFO] Frame heartbeat frame=11472 fps=30.05
+2026-07-27 15:51:11,782 [INFO] Frame heartbeat frame=11622 fps=29.70
+2026-07-27 15:51:16,821 [INFO] Frame heartbeat frame=11773 fps=29.24
+2026-07-27 15:51:21,857 [INFO] Frame heartbeat frame=11925 fps=30.40
+2026-07-27 15:51:26,865 [INFO] Frame heartbeat frame=12076 fps=30.39
+2026-07-27 15:51:31,899 [INFO] Frame heartbeat frame=12227 fps=31.09
+2026-07-27 15:51:36,901 [INFO] Frame heartbeat frame=12375 fps=29.20
+2026-07-27 15:51:41,945 [INFO] Frame heartbeat frame=12525 fps=28.07
+2026-07-27 15:51:46,969 [INFO] Frame heartbeat frame=12678 fps=30.47
+2026-07-27 15:51:51,978 [INFO] Frame heartbeat frame=12829 fps=29.61
+2026-07-27 15:51:56,996 [INFO] Frame heartbeat frame=12979 fps=29.48
+2026-07-27 15:52:02,023 [INFO] Frame heartbeat frame=13130 fps=30.25
+2026-07-27 15:52:07,059 [INFO] Frame heartbeat frame=13279 fps=29.42
+2026-07-27 15:52:12,121 [INFO] Frame heartbeat frame=13432 fps=29.64
+2026-07-27 15:52:17,187 [INFO] Frame heartbeat frame=13584 fps=29.08
+2026-07-27 15:52:22,205 [INFO] Frame heartbeat frame=13736 fps=30.08
+2026-07-27 15:52:27,207 [INFO] Frame heartbeat frame=13885 fps=29.97
+2026-07-27 15:52:32,222 [INFO] Frame heartbeat frame=14036 fps=29.92
+2026-07-27 15:52:37,292 [INFO] Frame heartbeat frame=14187 fps=29.66
+2026-07-27 15:52:42,312 [INFO] Frame heartbeat frame=14338 fps=29.55
+2026-07-27 15:52:44,957 [INFO] Training upload complete label=raveling key=training_data/images/raveling-frame14395-20260727_155244-181579.jpg
+2026-07-27 15:52:47,347 [INFO] Frame heartbeat frame=14490 fps=30.20
+2026-07-27 15:52:52,397 [INFO] Frame heartbeat frame=14641 fps=30.10
+2026-07-27 15:52:57,435 [INFO] Frame heartbeat frame=14792 fps=29.45
+2026-07-27 15:53:02,452 [INFO] Frame heartbeat frame=14942 fps=29.36
+2026-07-27 15:53:07,474 [INFO] Frame heartbeat frame=15093 fps=29.99
+2026-07-27 15:53:12,495 [INFO] Frame heartbeat frame=15242 fps=29.06
+2026-07-27 15:53:17,546 [INFO] Frame heartbeat frame=15395 fps=30.08
+2026-07-27 15:53:22,551 [INFO] Frame heartbeat frame=15546 fps=30.08
+2026-07-27 15:53:27,567 [INFO] Frame heartbeat frame=15696 fps=29.63
+2026-07-27 15:53:32,567 [INFO] Frame heartbeat frame=15845 fps=29.62
+2026-07-27 15:53:37,582 [INFO] Frame heartbeat frame=15997 fps=29.98
+2026-07-27 15:53:42,607 [INFO] Frame heartbeat frame=16146 fps=28.86
+2026-07-27 15:53:47,608 [INFO] Frame heartbeat frame=16297 fps=29.88
+2026-07-27 15:53:52,646 [INFO] Frame heartbeat frame=16448 fps=30.06
+2026-07-27 15:53:57,709 [INFO] Frame heartbeat frame=16600 fps=29.77
+2026-07-27 15:54:02,726 [INFO] Frame heartbeat frame=16751 fps=29.88
+2026-07-27 15:54:07,812 [INFO] Frame heartbeat frame=16903 fps=29.94
+2026-07-27 15:54:12,827 [INFO] Frame heartbeat frame=17054 fps=29.93
+2026-07-27 15:54:17,847 [INFO] Frame heartbeat frame=17205 fps=30.85
+2026-07-27 15:54:22,856 [INFO] Frame heartbeat frame=17354 fps=30.64
+2026-07-27 15:54:27,875 [INFO] Frame heartbeat frame=17505 fps=29.49
+2026-07-27 15:54:32,889 [INFO] Frame heartbeat frame=17656 fps=30.25
+2026-07-27 15:54:37,924 [INFO] Frame heartbeat frame=17807 fps=30.25
+2026-07-27 15:54:42,938 [INFO] Frame heartbeat frame=17957 fps=30.07
+2026-07-27 15:54:47,953 [INFO] Frame heartbeat frame=18107 fps=29.58
+2026-07-27 15:54:52,989 [INFO] Frame heartbeat frame=18259 fps=30.96
+2026-07-27 15:54:58,004 [INFO] Frame heartbeat frame=18410 fps=30.33
+2026-07-27 15:55:03,008 [INFO] Frame heartbeat frame=18559 fps=30.86
+2026-07-27 15:55:08,025 [INFO] Frame heartbeat frame=18710 fps=29.65
+2026-07-27 15:55:13,032 [INFO] Frame heartbeat frame=18859 fps=29.30
+2026-07-27 15:55:18,084 [INFO] Frame heartbeat frame=19010 fps=29.49
+2026-07-27 15:55:23,114 [INFO] Frame heartbeat frame=19161 fps=29.28
+2026-07-27 15:55:28,159 [INFO] Frame heartbeat frame=19313 fps=29.10
+2026-07-27 15:55:33,242 [INFO] Frame heartbeat frame=19466 fps=29.09
+2026-07-27 15:55:38,273 [INFO] Frame heartbeat frame=19616 fps=29.03
+2026-07-27 15:55:43,299 [INFO] Frame heartbeat frame=19768 fps=29.63
+2026-07-27 15:55:48,357 [INFO] Frame heartbeat frame=19919 fps=29.17
+2026-07-27 15:55:53,377 [INFO] Frame heartbeat frame=20071 fps=30.60
+2026-07-27 15:55:58,413 [INFO] Frame heartbeat frame=20222 fps=30.47
+2026-07-27 15:56:03,423 [INFO] Frame heartbeat frame=20370 fps=29.61
+2026-07-27 15:56:08,432 [INFO] Frame heartbeat frame=20521 fps=30.16
+2026-07-27 15:56:13,455 [INFO] Frame heartbeat frame=20673 fps=29.60
+2026-07-27 15:56:18,541 [INFO] Frame heartbeat frame=20825 fps=30.61
+2026-07-27 15:56:23,549 [INFO] Frame heartbeat frame=20975 fps=29.48
+2026-07-27 15:56:28,664 [INFO] Frame heartbeat frame=21127 fps=28.65
+2026-07-27 15:56:33,709 [INFO] Frame heartbeat frame=21281 fps=31.10
+2026-07-27 15:56:38,750 [INFO] Frame heartbeat frame=21431 fps=29.74
+2026-07-27 15:56:43,761 [INFO] Frame heartbeat frame=21583 fps=30.36
+2026-07-27 15:56:48,770 [INFO] Frame heartbeat frame=21732 fps=29.40
+2026-07-27 15:56:53,776 [INFO] Frame heartbeat frame=21883 fps=29.82
+2026-07-27 15:56:58,808 [INFO] Frame heartbeat frame=22034 fps=31.85
+2026-07-27 15:57:03,892 [INFO] Frame heartbeat frame=22185 fps=29.52
+2026-07-27 15:57:08,917 [INFO] Frame heartbeat frame=22333 fps=28.49
+2026-07-27 15:57:13,946 [INFO] Frame heartbeat frame=22487 fps=29.50
+2026-07-27 15:57:18,975 [INFO] Frame heartbeat frame=22639 fps=30.05
+2026-07-27 15:57:24,036 [INFO] Frame heartbeat frame=22790 fps=30.77
+2026-07-27 15:57:29,089 [INFO] Frame heartbeat frame=22941 fps=30.02
+
+====================================================================================================
+### [recent-edge-log-tail]
+CMD: tail -n 100 $(ls -t ~/miniproj_epan/hailo-rpi5-examples/logs/edge_*.log 2>/dev/null | head -1) 2>&1
+----------------------------------------------------------------------------------------------------
+2026-07-27 15:49:16,117 [INFO] Frame heartbeat frame=8152 fps=29.70
+2026-07-27 15:49:21,120 [INFO] Frame heartbeat frame=8304 fps=30.42
+2026-07-27 15:49:26,128 [INFO] Frame heartbeat frame=8454 fps=30.40
+2026-07-27 15:49:31,218 [INFO] Frame heartbeat frame=8604 fps=29.32
+2026-07-27 15:49:36,228 [INFO] Frame heartbeat frame=8756 fps=30.27
+2026-07-27 15:49:41,248 [INFO] Frame heartbeat frame=8906 fps=29.67
+2026-07-27 15:49:46,265 [INFO] Frame heartbeat frame=9057 fps=29.99
+2026-07-27 15:49:51,312 [INFO] Frame heartbeat frame=9208 fps=29.36
+2026-07-27 15:49:56,385 [INFO] Frame heartbeat frame=9360 fps=29.75
+2026-07-27 15:50:01,410 [INFO] Frame heartbeat frame=9511 fps=29.83
+2026-07-27 15:50:06,416 [INFO] Frame heartbeat frame=9661 fps=29.44
+2026-07-27 15:50:11,426 [INFO] Frame heartbeat frame=9812 fps=30.31
+2026-07-27 15:50:16,427 [INFO] Frame heartbeat frame=9962 fps=29.84
+2026-07-27 15:50:21,478 [INFO] Frame heartbeat frame=10114 fps=30.33
+2026-07-27 15:50:26,539 [INFO] Frame heartbeat frame=10265 fps=30.48
+2026-07-27 15:50:31,587 [INFO] Frame heartbeat frame=10416 fps=29.74
+2026-07-27 15:50:36,604 [INFO] Frame heartbeat frame=10567 fps=30.04
+2026-07-27 15:50:41,616 [INFO] Frame heartbeat frame=10718 fps=30.92
+2026-07-27 15:50:46,654 [INFO] Frame heartbeat frame=10869 fps=29.99
+2026-07-27 15:50:51,662 [INFO] Frame heartbeat frame=11018 fps=29.60
+2026-07-27 15:50:56,695 [INFO] Frame heartbeat frame=11170 fps=29.62
+2026-07-27 15:51:01,744 [INFO] Frame heartbeat frame=11320 fps=29.49
+2026-07-27 15:51:06,773 [INFO] Frame heartbeat frame=11472 fps=30.05
+2026-07-27 15:51:11,782 [INFO] Frame heartbeat frame=11622 fps=29.70
+2026-07-27 15:51:16,821 [INFO] Frame heartbeat frame=11773 fps=29.24
+2026-07-27 15:51:21,857 [INFO] Frame heartbeat frame=11925 fps=30.40
+2026-07-27 15:51:26,865 [INFO] Frame heartbeat frame=12076 fps=30.39
+2026-07-27 15:51:31,899 [INFO] Frame heartbeat frame=12227 fps=31.09
+2026-07-27 15:51:36,901 [INFO] Frame heartbeat frame=12375 fps=29.20
+2026-07-27 15:51:41,945 [INFO] Frame heartbeat frame=12525 fps=28.07
+2026-07-27 15:51:46,969 [INFO] Frame heartbeat frame=12678 fps=30.47
+2026-07-27 15:51:51,978 [INFO] Frame heartbeat frame=12829 fps=29.61
+2026-07-27 15:51:56,996 [INFO] Frame heartbeat frame=12979 fps=29.48
+2026-07-27 15:52:02,023 [INFO] Frame heartbeat frame=13130 fps=30.25
+2026-07-27 15:52:07,059 [INFO] Frame heartbeat frame=13279 fps=29.42
+2026-07-27 15:52:12,121 [INFO] Frame heartbeat frame=13432 fps=29.64
+2026-07-27 15:52:17,187 [INFO] Frame heartbeat frame=13584 fps=29.08
+2026-07-27 15:52:22,205 [INFO] Frame heartbeat frame=13736 fps=30.08
+2026-07-27 15:52:27,207 [INFO] Frame heartbeat frame=13885 fps=29.97
+2026-07-27 15:52:32,222 [INFO] Frame heartbeat frame=14036 fps=29.92
+2026-07-27 15:52:37,292 [INFO] Frame heartbeat frame=14187 fps=29.66
+2026-07-27 15:52:42,312 [INFO] Frame heartbeat frame=14338 fps=29.55
+2026-07-27 15:52:44,957 [INFO] Training upload complete label=raveling key=training_data/images/raveling-frame14395-20260727_155244-181579.jpg
+2026-07-27 15:52:47,347 [INFO] Frame heartbeat frame=14490 fps=30.20
+2026-07-27 15:52:52,397 [INFO] Frame heartbeat frame=14641 fps=30.10
+2026-07-27 15:52:57,435 [INFO] Frame heartbeat frame=14792 fps=29.45
+2026-07-27 15:53:02,452 [INFO] Frame heartbeat frame=14942 fps=29.36
+2026-07-27 15:53:07,474 [INFO] Frame heartbeat frame=15093 fps=29.99
+2026-07-27 15:53:12,495 [INFO] Frame heartbeat frame=15242 fps=29.06
+2026-07-27 15:53:17,546 [INFO] Frame heartbeat frame=15395 fps=30.08
+2026-07-27 15:53:22,551 [INFO] Frame heartbeat frame=15546 fps=30.08
+2026-07-27 15:53:27,567 [INFO] Frame heartbeat frame=15696 fps=29.63
+2026-07-27 15:53:32,567 [INFO] Frame heartbeat frame=15845 fps=29.62
+2026-07-27 15:53:37,582 [INFO] Frame heartbeat frame=15997 fps=29.98
+2026-07-27 15:53:42,607 [INFO] Frame heartbeat frame=16146 fps=28.86
+2026-07-27 15:53:47,608 [INFO] Frame heartbeat frame=16297 fps=29.88
+2026-07-27 15:53:52,646 [INFO] Frame heartbeat frame=16448 fps=30.06
+2026-07-27 15:53:57,709 [INFO] Frame heartbeat frame=16600 fps=29.77
+2026-07-27 15:54:02,726 [INFO] Frame heartbeat frame=16751 fps=29.88
+2026-07-27 15:54:07,812 [INFO] Frame heartbeat frame=16903 fps=29.94
+2026-07-27 15:54:12,827 [INFO] Frame heartbeat frame=17054 fps=29.93
+2026-07-27 15:54:17,847 [INFO] Frame heartbeat frame=17205 fps=30.85
+2026-07-27 15:54:22,856 [INFO] Frame heartbeat frame=17354 fps=30.64
+2026-07-27 15:54:27,875 [INFO] Frame heartbeat frame=17505 fps=29.49
+2026-07-27 15:54:32,889 [INFO] Frame heartbeat frame=17656 fps=30.25
+2026-07-27 15:54:37,924 [INFO] Frame heartbeat frame=17807 fps=30.25
+2026-07-27 15:54:42,938 [INFO] Frame heartbeat frame=17957 fps=30.07
+2026-07-27 15:54:47,953 [INFO] Frame heartbeat frame=18107 fps=29.58
+2026-07-27 15:54:52,989 [INFO] Frame heartbeat frame=18259 fps=30.96
+2026-07-27 15:54:58,004 [INFO] Frame heartbeat frame=18410 fps=30.33
+2026-07-27 15:55:03,008 [INFO] Frame heartbeat frame=18559 fps=30.86
+2026-07-27 15:55:08,025 [INFO] Frame heartbeat frame=18710 fps=29.65
+2026-07-27 15:55:13,032 [INFO] Frame heartbeat frame=18859 fps=29.30
+2026-07-27 15:55:18,084 [INFO] Frame heartbeat frame=19010 fps=29.49
+2026-07-27 15:55:23,114 [INFO] Frame heartbeat frame=19161 fps=29.28
+2026-07-27 15:55:28,159 [INFO] Frame heartbeat frame=19313 fps=29.10
+2026-07-27 15:55:33,242 [INFO] Frame heartbeat frame=19466 fps=29.09
+2026-07-27 15:55:38,273 [INFO] Frame heartbeat frame=19616 fps=29.03
+2026-07-27 15:55:43,299 [INFO] Frame heartbeat frame=19768 fps=29.63
+2026-07-27 15:55:48,357 [INFO] Frame heartbeat frame=19919 fps=29.17
+2026-07-27 15:55:53,377 [INFO] Frame heartbeat frame=20071 fps=30.60
+2026-07-27 15:55:58,413 [INFO] Frame heartbeat frame=20222 fps=30.47
+2026-07-27 15:56:03,423 [INFO] Frame heartbeat frame=20370 fps=29.61
+2026-07-27 15:56:08,432 [INFO] Frame heartbeat frame=20521 fps=30.16
+2026-07-27 15:56:13,455 [INFO] Frame heartbeat frame=20673 fps=29.60
+2026-07-27 15:56:18,541 [INFO] Frame heartbeat frame=20825 fps=30.61
+2026-07-27 15:56:23,549 [INFO] Frame heartbeat frame=20975 fps=29.48
+2026-07-27 15:56:28,664 [INFO] Frame heartbeat frame=21127 fps=28.65
+2026-07-27 15:56:33,709 [INFO] Frame heartbeat frame=21281 fps=31.10
+2026-07-27 15:56:38,750 [INFO] Frame heartbeat frame=21431 fps=29.74
+2026-07-27 15:56:43,761 [INFO] Frame heartbeat frame=21583 fps=30.36
+2026-07-27 15:56:48,770 [INFO] Frame heartbeat frame=21732 fps=29.40
+2026-07-27 15:56:53,776 [INFO] Frame heartbeat frame=21883 fps=29.82
+2026-07-27 15:56:58,808 [INFO] Frame heartbeat frame=22034 fps=31.85
+2026-07-27 15:57:03,892 [INFO] Frame heartbeat frame=22185 fps=29.52
+2026-07-27 15:57:08,917 [INFO] Frame heartbeat frame=22333 fps=28.49
+2026-07-27 15:57:13,946 [INFO] Frame heartbeat frame=22487 fps=29.50
+2026-07-27 15:57:18,975 [INFO] Frame heartbeat frame=22639 fps=30.05
+2026-07-27 15:57:24,036 [INFO] Frame heartbeat frame=22790 fps=30.77
+2026-07-27 15:57:29,089 [INFO] Frame heartbeat frame=22941 fps=30.02
+
+====================================================================================================
+### [logs-count]
+CMD: ls ~/miniproj_epan/hailo-rpi5-examples/logs/ | wc -l
+----------------------------------------------------------------------------------------------------
+3078
+
+====================================================================================================
+### [logs-total-size]
+CMD: du -sh ~/miniproj_epan/hailo-rpi5-examples/logs/ 2>&1
+----------------------------------------------------------------------------------------------------
+305M	/home/rasp/miniproj_epan/hailo-rpi5-examples/logs/
+
+====================================================================================================
+### [hailort-log-tail]
+CMD: tail -n 60 ~/miniproj_epan/hailo-rpi5-examples/hailort.log 2>&1
+----------------------------------------------------------------------------------------------------
+[2026-07-27 13:04:47.549] [1525] [HailoRT] [info] [vdevice.cpp:523] [create] Creating vdevice with params: device_count: 1, scheduling_algorithm: ROUND_ROBIN, multi_process_service: true
+[2026-07-27 13:04:48.740] [1525] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.62+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.62-1+rpt1~bookworm (2026-01-19) aarch64
+[2026-07-27 13:04:48.742] [1525] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 13:04:48.865] [1525] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+[2026-07-27 13:04:48.865] [1525] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+[2026-07-27 13:04:49.079] [1525] [HailoRT] [info] [infer_model.cpp:436] [configure] Configuring network group 'yolov11n' with params: batch size: 2, power mode: PERFORMANCE, latency: NONE
+[2026-07-27 13:04:49.082] [1525] [HailoRT] [info] [multi_io_elements.cpp:756] [create] Created (AsyncHwEl)
+[2026-07-27 13:04:49.083] [1525] [HailoRT] [info] [queue_elements.cpp:450] [create] Created (EntryPushQEl0yolov11n/input_layer1 | timeout: 10s)
+[2026-07-27 13:04:49.083] [1525] [HailoRT] [info] [filter_elements.cpp:101] [create] Created (PreInferEl3yolov11n/input_layer1 | Reorder - src_order: RGB4, src_shape: (640, 640, 3), dst_order: NHCW, dst_shape: (640, 640, 3))
+[2026-07-27 13:04:49.084] [1525] [HailoRT] [info] [queue_elements.cpp:450] [create] Created (PushQEl3yolov11n/input_layer1 | timeout: 10s)
+[2026-07-27 13:04:49.084] [1525] [HailoRT] [info] [multi_io_elements.cpp:135] [create] Created (NmsPPMuxEl0YOLOV8-Post-Process | Op YOLOV8, Name: YOLOV8-Post-Process, Score threshold: 0.300, IoU threshold: 0.45, Classes: 5, Cross classes: false, NMS results order: BY_CLASS, Max bboxes per class: 100, Image height: 640, Image width: 640)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [queue_elements.cpp:942] [create] Created (MultiPushQEl0YOLOV8-Post-Process | timeout: 10s)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [edge_elements.cpp:187] [create] Created (LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] EntryPushQEl0yolov11n/input_layer1 | inputs: user | outputs: PreInferEl3yolov11n/input_layer1(running in thread_id: 2871)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] PreInferEl3yolov11n/input_layer1 | inputs: EntryPushQEl0yolov11n/input_layer1[0] | outputs: PushQEl3yolov11n/input_layer1
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] PushQEl3yolov11n/input_layer1 | inputs: PreInferEl3yolov11n/input_layer1[0] | outputs: AsyncHwEl(running in thread_id: 2872)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] AsyncHwEl | inputs: PushQEl3yolov11n/input_layer1[0] | outputs: MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] MultiPushQEl0YOLOV8-Post-Process | inputs: AsyncHwEl[0] AsyncHwEl[1] AsyncHwEl[2] AsyncHwEl[3] AsyncHwEl[4] AsyncHwEl[5] | outputs: NmsPPMuxEl0YOLOV8-Post-Process(running in thread_id: 2874)
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] NmsPPMuxEl0YOLOV8-Post-Process | inputs: MultiPushQEl0YOLOV8-Post-Process[0] | outputs: LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process
+[2026-07-27 13:04:49.085] [1525] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process | inputs: NmsPPMuxEl0YOLOV8-Post-Process[0] | outputs: user
+[2026-07-27 13:04:49.635] [2854] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+[2026-07-27 15:43:45.573] [1525] [HailoRT] [info] [async_infer_runner.cpp:86] [shutdown] Pipeline was aborted. Shutting it down
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:1131] [execute_deactivate] enqueue() in element MultiPushQEl0YOLOV8-Post-Process was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:570] [execute_deactivate] enqueue() in element PushQEl3yolov11n/input_layer1 was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:570] [execute_deactivate] enqueue() in element EntryPushQEl0yolov11n/input_layer1 was aborted, got status = HAILO_SHUTDOWN_EVENT_SIGNALED(57)
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element EntryPushQEl0yolov11n/input_layer1 has 0 frames in his Queue on destruction
+[2026-07-27 15:43:45.577] [1525] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element PushQEl3yolov11n/input_layer1 has 0 frames in his Queue on destruction
+[2026-07-27 15:43:45.803] [2869] [HailoRT] [info] [vdevice.cpp:424] [listener_run_in_thread] Shutdown event was signaled in listener_run_in_thread
+[2026-07-27 15:44:42.892] [237293] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.62+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.62-1+rpt1~bookworm (2026-01-19) aarch64
+[2026-07-27 15:44:42.894] [237293] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 15:44:42.895] [237293] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 15:44:42.950] [237301] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.62+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.62-1+rpt1~bookworm (2026-01-19) aarch64
+[2026-07-27 15:44:42.952] [237301] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 15:44:42.953] [237301] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 15:44:43.113] [237238] [HailoRT] [info] [vdevice.cpp:523] [create] Creating vdevice with params: device_count: 1, scheduling_algorithm: ROUND_ROBIN, multi_process_service: true
+[2026-07-27 15:44:44.128] [237238] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.62+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.62-1+rpt1~bookworm (2026-01-19) aarch64
+[2026-07-27 15:44:44.129] [237238] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2026-07-27 15:44:44.135] [237238] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+[2026-07-27 15:44:44.135] [237238] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+[2026-07-27 15:44:44.252] [237238] [HailoRT] [info] [infer_model.cpp:436] [configure] Configuring network group 'yolov11n' with params: batch size: 2, power mode: PERFORMANCE, latency: NONE
+[2026-07-27 15:44:44.254] [237238] [HailoRT] [info] [multi_io_elements.cpp:756] [create] Created (AsyncHwEl)
+[2026-07-27 15:44:44.254] [237238] [HailoRT] [info] [queue_elements.cpp:450] [create] Created (EntryPushQEl0yolov11n/input_layer1 | timeout: 10s)
+[2026-07-27 15:44:44.254] [237238] [HailoRT] [info] [filter_elements.cpp:101] [create] Created (PreInferEl3yolov11n/input_layer1 | Reorder - src_order: RGB4, src_shape: (640, 640, 3), dst_order: NHCW, dst_shape: (640, 640, 3))
+[2026-07-27 15:44:44.254] [237238] [HailoRT] [info] [queue_elements.cpp:450] [create] Created (PushQEl3yolov11n/input_layer1 | timeout: 10s)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [multi_io_elements.cpp:135] [create] Created (NmsPPMuxEl0YOLOV8-Post-Process | Op YOLOV8, Name: YOLOV8-Post-Process, Score threshold: 0.300, IoU threshold: 0.45, Classes: 5, Cross classes: false, NMS results order: BY_CLASS, Max bboxes per class: 100, Image height: 640, Image width: 640)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [queue_elements.cpp:942] [create] Created (MultiPushQEl0YOLOV8-Post-Process | timeout: 10s)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [edge_elements.cpp:187] [create] Created (LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] EntryPushQEl0yolov11n/input_layer1 | inputs: user | outputs: PreInferEl3yolov11n/input_layer1(running in thread_id: 237359)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] PreInferEl3yolov11n/input_layer1 | inputs: EntryPushQEl0yolov11n/input_layer1[0] | outputs: PushQEl3yolov11n/input_layer1
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] PushQEl3yolov11n/input_layer1 | inputs: PreInferEl3yolov11n/input_layer1[0] | outputs: AsyncHwEl(running in thread_id: 237360)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] AsyncHwEl | inputs: PushQEl3yolov11n/input_layer1[0] | outputs: MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process MultiPushQEl0YOLOV8-Post-Process
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] MultiPushQEl0YOLOV8-Post-Process | inputs: AsyncHwEl[0] AsyncHwEl[1] AsyncHwEl[2] AsyncHwEl[3] AsyncHwEl[4] AsyncHwEl[5] | outputs: NmsPPMuxEl0YOLOV8-Post-Process(running in thread_id: 237361)
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] NmsPPMuxEl0YOLOV8-Post-Process | inputs: MultiPushQEl0YOLOV8-Post-Process[0] | outputs: LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process
+[2026-07-27 15:44:44.255] [237238] [HailoRT] [info] [pipeline.cpp:891] [print_deep_description] LastAsyncEl0NmsPPMuxEl0YOLOV8-Post-Process | inputs: NmsPPMuxEl0YOLOV8-Post-Process[0] | outputs: user
+[2026-07-27 15:44:44.714] [237345] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: yolov11n
+
+====================================================================================================
+### [second-detection-proc-detail]
+CMD: ps -f -p 1525,237238 2>&1
+----------------------------------------------------------------------------------------------------
+UID          PID    PPID  C STIME TTY          TIME CMD
+rasp        1525       1 99 12:33 ?        07:13:14 Hailo Detection App
+rasp      237238  237087 99 15:44 pts/2    00:34:23 Hailo Detection App
+
+====================================================================================================
+### [second-proc-cwd-cmdline]
+CMD: for p in 1525 237238; do echo "--- pid $p ---"; sudo -n readlink /proc/$p/cwd 2>&1 || readlink /proc/$p/cwd 2>&1; tr '\0' ' ' < /proc/$p/cmdline 2>&1; echo; done
+----------------------------------------------------------------------------------------------------
+--- pid 1525 ---
+/home/rasp/miniproj_epan/hailo-rpi5-examples
+Hailo Detection App                                                                                                                                                                                                                                
+--- pid 237238 ---
+/home/rasp/miniproj_epan/hailo-rpi5-examples
+Hailo Detection App                                                                                                                                                                                                                                
+
+====================================================================================================
+### [who-logged-in]
+CMD: who 2>&1
+----------------------------------------------------------------------------------------------------
+rasp                  2026-07-27 12:10
+rasp     tty1         2026-07-27 12:10
+
+====================================================================================================
+### [last-logins]
+CMD: last -n 10 2>&1
+----------------------------------------------------------------------------------------------------
+rasp     tty1                          Mon Jul 27 12:10    gone - no logout
+rasp                                   Mon Jul 27 12:10    gone - no logout
+reboot   system boot  6.12.62+rpt-rpi- Mon Jul 27 11:16   still running
+rasp     tty1                          Sun Jul 26 02:41 - crash (1+08:35)
+rasp                                   Sun Jul 26 02:41 - crash (1+08:35)
+reboot   system boot  6.12.62+rpt-rpi- Sun Jul 26 02:16   still running
+rasp     tty1                          Sun Jul 26 02:40 - crash  (-00:23)
+rasp                                   Sun Jul 26 02:40 - crash  (-00:23)
+reboot   system boot  6.12.62+rpt-rpi- Sun Jul 26 02:16   still running
+rasp     tty1                          Sat Jul 25 16:55 - crash  (09:21)
+
+wtmp begins Sat Jul  4 17:16:59 2026
+
+====================================================================================================
+### [disk-io-top]
+CMD: iostat 2>&1 || true
+----------------------------------------------------------------------------------------------------
+bash: line 1: iostat: command not found
+
+====================================================================================================
+### [system-journal-errors]
+CMD: journalctl -p err --no-pager -n 40 2>&1
+----------------------------------------------------------------------------------------------------
+-- No entries --
+
+====================================================================================================
+### [nmcli-status]
+CMD: nmcli device status 2>&1
+----------------------------------------------------------------------------------------------------
+DEVICE      TYPE      STATE                   CONNECTION         
+eth0        ethernet  connected               Wired connection 1 
+tailscale0  tun       connected (externally)  tailscale0         
+lo          loopback  connected (externally)  lo                 
+docker0     bridge    connected (externally)  docker0            
+wlan0       wifi      unavailable             --                 
+
+====================================================================================================
+### [fstab]
+CMD: cat /etc/fstab 2>&1
+----------------------------------------------------------------------------------------------------
+proc            /proc           proc    defaults          0       0
+PARTUUID=f92ec7b2-01  /boot/firmware  vfat    defaults          0       2
+PARTUUID=f92ec7b2-02  /               ext4    defaults,noatime  0       1
+UUID=5D45-5D84  /mnt/ssd  exfat  nofail,x-systemd.automount,x-systemd.device-timeout=10,uid=1000,gid=1000,umask=022  0  0
+UUID=0AA6-3C97  /mnt/pendrive  vfat  nofail,x-systemd.automount,x-systemd.device-timeout=10,uid=1000,gid=1000,umask=022  0  0
+# a swapfile is not a swap partition, no line here
+#   use  dphys-swapfile swap[on|off]  for that
+
+====================================================================================================
+### [apt-updates]
+CMD: apt list --upgradable 2>&1 | head -20
+----------------------------------------------------------------------------------------------------
+
+WARNING: apt does not have a stable CLI interface. Use with caution in scripts.
+
+Listing...
+base-files/oldstable 12.4+deb12u15 arm64 [upgradable from: 12.4+deb12u13]
+bash/oldstable 5.2.15-2+b13 arm64 [upgradable from: 5.2.15-2+b10]
+busybox/oldstable 1:1.35.0-4+deb12u1+b1 arm64 [upgradable from: 1:1.35.0-4+b7]
+chromium-common/oldstable 1:150.0.7871.124-1~deb12u1+rpt1 arm64 [upgradable from: 1:144.0.7559.109-2~deb12u1+rpt1]
+chromium-l10n/oldstable,oldstable 1:150.0.7871.124-1~deb12u1+rpt1 all [upgradable from: 1:144.0.7559.109-2~deb12u1+rpt1]
+chromium-sandbox/oldstable 1:150.0.7871.124-1~deb12u1+rpt1 arm64 [upgradable from: 1:144.0.7559.109-2~deb12u1+rpt1]
+chromium/oldstable 1:150.0.7871.124-1~deb12u1+rpt1 arm64 [upgradable from: 1:144.0.7559.109-2~deb12u1+rpt1]
+containerd.io/bookworm 2.2.6-1~debian.12~bookworm arm64 [upgradable from: 2.2.1-1~debian.12~bookworm]
+curl/oldstable 7.88.1-10+deb12u15 arm64 [upgradable from: 7.88.1-10+deb12u14]
+distro-info-data/oldstable,oldstable 0.58+deb12u7 all [upgradable from: 0.58+deb12u6]
+dnsmasq-base/oldstable,oldstable-security 2.90-4~deb12u2 arm64 [upgradable from: 2.90-4~deb12u1]
+docker-buildx-plugin/bookworm 0.35.0-1~debian.12~bookworm arm64 [upgradable from: 0.31.1-1~debian.12~bookworm]
+docker-ce-cli/bookworm 5:29.6.2-1~debian.12~bookworm arm64 [upgradable from: 5:29.2.1-1~debian.12~bookworm]
+docker-ce-rootless-extras/bookworm 5:29.6.2-1~debian.12~bookworm arm64 [upgradable from: 5:29.2.1-1~debian.12~bookworm]
+docker-ce/bookworm 5:29.6.2-1~debian.12~bookworm arm64 [upgradable from: 5:29.2.1-1~debian.12~bookworm]
+docker-compose-plugin/bookworm 5.3.1-1~debian.12~bookworm arm64 [upgradable from: 5.0.2-1~debian.12~bookworm]

@@ -1,0 +1,12 @@
+# The SSH password to the truck's Pi lives here. This folder is not a git repo today;
+# this file exists so that the moment it becomes one, the credential does not go with it.
+.env
+
+# Pi host key learned on first connect (dashboard/ssh_client.py). Machine-local trust
+# state, not something to share between laptops.
+known_hosts
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

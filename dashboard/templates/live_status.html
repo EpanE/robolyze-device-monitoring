@@ -1,0 +1,282 @@
+{% extends "base.html" %}
+{% set active = "live" %}
+{% block head_extra %}
+{# Vendored (static/vendor/leaflet, Leaflet 1.9.4, SRI-verified against unpkg). Served
+   locally because this tool is used in the field: off the CDN, `L` was undefined and the
+   whole map block threw. Map tiles still need internet — the marker renders on a blank
+   grid when offline, rather than the page erroring out. #}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}" />
+<script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
+{% endblock %}
+{% block content %}
+  <section class="toolbar">
+    <form method="post" action="{{ url_for('refresh') }}" class="inline-form">
+      <button type="submit" class="btn btn-primary">Refresh Now</button>
+    </form>
+    <label class="autopoll">
+      <input type="checkbox" id="autopoll-toggle">
+      Auto-refresh every 30s
+    </label>
+    <span id="poll-status" class="poll-status"></span>
+    <span class="last-refreshed" id="last-refreshed">
+      {% if state.last_refreshed %}
+        Last refreshed: {{ state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S') }}
+      {% else %}
+        Never refreshed
+      {% endif %}
+    </span>
+  </section>
+
+  {# The map element is always present, hidden until there is somewhere to point it. It
+     used to be rendered only inside {% if marker %}, which meant the first fix after a
+     cold start had no element to draw into and needed a full page load to appear. #}
+  <section class="location-panel">
+    <div id="map" class="map {{ 'map-stale' if marker and marker.freshness == 'stale' else '' }}"
+         {% if not marker %}hidden{% endif %}></div>
+    <div class="location-meta" id="location-meta" {% if not marker %}hidden{% endif %}>
+      <span id="location-label">{% if marker %}{{ marker.label }}{% if town %} — {{ town }}{% endif %}{% endif %}</span>
+      <a id="location-link" href="{{ marker.maps_url if marker else '#' }}" target="_blank" rel="noopener">Open in Google Maps ↗</a>
+    </div>
+    <p class="hint" id="no-location" {% if marker %}hidden{% endif %}>No GPS location recorded yet.</p>
+  </section>
+
+  <section class="card-grid" id="card-grid">{% include "_cards.html" %}</section>
+
+  <section class="trend-panel">
+    <h2 class="section-title">Trends</h2>
+    <div id="trends">{% include "_trends.html" %}</div>
+  </section>
+
+  <section class="screenshot-panel">
+    <div class="toolbar">
+      <button type="button" id="grab-screenshot" class="btn">Grab Screenshot</button>
+      <span id="screenshot-status">
+        {% if state.screenshot_error %}Failed: {{ state.screenshot_error }}{% endif %}
+      </span>
+      {# A failed grab keeps the previous capture rather than blanking the panel, and the
+         auto-refresh only recaptures every few minutes, so this timestamp is what stops a
+         retained image from passing as the current screen. #}
+      <span class="last-refreshed" id="screenshot-ts" {% if not state.screenshot %}hidden{% endif %}>
+        {% if state.screenshot %}Captured: {{ state.screenshot.ts.strftime('%Y-%m-%d %H:%M:%S') }}{% endif %}
+      </span>
+    </div>
+    {% if state.screenshot %}
+      <img id="screenshot-img"
+           src="{{ url_for('screenshot') }}?v={{ state.screenshot.version }}"
+           alt="Pi screenshot — captured periodically on refresh" />
+    {% else %}
+      <p class="hint" id="screenshot-placeholder">No screenshot captured yet.</p>
+    {% endif %}
+  </section>
+
+  <p class="legend">▶️ = running &nbsp; ⏸️ = pause &nbsp; ✅ = ok &nbsp; 🔴 = not ok &nbsp; ⚪ = not determined</p>
+
+  <script>
+    const toggle = document.getElementById("autopoll-toggle");
+    const pollStatus = document.getElementById("poll-status");
+    let pollTimer = null;
+
+    // Built once and kept. The old poll finished by reloading the whole page, which tore
+    // down and rebuilt the map every 30 seconds — throwing away the operator's pan and
+    // zoom while they were looking at it.
+    let map = null;
+    let mapMarker = null;
+
+    const MARKER_COLOURS = { fresh: "#22c55e", stale: "#f59e0b" };
+
+    function applyMarker(marker) {
+      const mapEl = document.getElementById("map");
+      const meta = document.getElementById("location-meta");
+      const none = document.getElementById("no-location");
+
+      if (!marker) {
+        mapEl.hidden = true;
+        meta.hidden = true;
+        none.hidden = false;
+        return;
+      }
+
+      mapEl.hidden = false;
+      meta.hidden = false;
+      none.hidden = true;
+      mapEl.classList.toggle("map-stale", marker.freshness === "stale");
+
+      document.getElementById("location-label").textContent =
+        marker.label + (marker.town ? " — " + marker.town : "");
+      document.getElementById("location-link").href = marker.maps_url;
+
+      if (typeof L === "undefined") {
+        mapEl.textContent = "Map library failed to load.";
+        return;
+      }
+
+      const colour = MARKER_COLOURS[marker.freshness] || MARKER_COLOURS.stale;
+      if (map === null) {
+        // Deferred until the first fix: before that the element is hidden, and Leaflet
+        // cannot size itself inside a hidden container.
+        map = L.map("map").setView([marker.lat, marker.lon], 15);
+        L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          maxZoom: 19,
+        }).addTo(map);
+        mapMarker = L.circleMarker([marker.lat, marker.lon], {
+          radius: 8, color: colour, fillColor: colour, fillOpacity: 0.9, weight: 2,
+        }).addTo(map);
+        map.invalidateSize();
+      } else {
+        // Moved, deliberately without setView: the operator may have panned away to look
+        // at something, and yanking the viewport back every 30s is the behaviour this
+        // rewrite exists to remove.
+        mapMarker.setLatLng([marker.lat, marker.lon]);
+        mapMarker.setStyle({ color: colour, fillColor: colour });
+      }
+    }
+
+    function screenshotImg() {
+      // Absent until the first capture — the panel renders a placeholder instead of an
+      // <img> with no src, which browsers draw as a broken-image icon.
+      const existing = document.getElementById("screenshot-img");
+      if (existing) return existing;
+      const placeholder = document.getElementById("screenshot-placeholder");
+      if (!placeholder) return null;
+      const el = document.createElement("img");
+      el.id = "screenshot-img";
+      el.alt = "Pi screenshot";
+      placeholder.replaceWith(el);
+      return el;
+    }
+
+    function setScreenshotSrc(version) {
+      const img = screenshotImg();
+      if (!img) return;
+      const next = "{{ url_for('screenshot') }}?v=" + version;
+      // Only when it actually changed: the screenshot is by far the largest thing on this
+      // page, and the refresh only recaptures every few minutes, so most ticks reuse it.
+      if (img.getAttribute("src") !== next) img.src = next;
+      img.hidden = false;
+    }
+
+    function applyStatus(payload) {
+      document.getElementById("banners").innerHTML = payload.banners_html;
+      document.getElementById("card-grid").innerHTML = payload.cards_html;
+      document.getElementById("trends").innerHTML = payload.trends_html;
+      document.getElementById("last-refreshed").textContent =
+        payload.last_refreshed ? "Last refreshed: " + payload.last_refreshed : "Never refreshed";
+
+      const marker = payload.marker;
+      if (marker) marker.town = payload.town;
+      applyMarker(marker);
+
+      document.getElementById("screenshot-status").textContent =
+        payload.screenshot_error ? "Failed: " + payload.screenshot_error : "";
+
+      const shotTs = document.getElementById("screenshot-ts");
+      if (payload.screenshot) {
+        shotTs.hidden = false;
+        shotTs.textContent = "Captured: " + payload.screenshot.ts;
+        setScreenshotSrc(payload.screenshot.version);
+      } else {
+        shotTs.hidden = true;
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(poll, 30000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    async function poll() {
+      // Nothing here may throw unhandled: an unhandled rejection used to leave the
+      // checkbox reading "on" while the page had silently stopped updating.
+      try {
+        // X-Requested-With makes the route answer 204/409 instead of a redirect: fetch()
+        // follows a 302 by default and would download the whole page body just for this
+        // handler to throw it away.
+        const resp = await fetch("{{ url_for('refresh') }}", {
+          method: "POST",
+          headers: { "X-Requested-With": "fetch" },
+        });
+        if (resp.status === 409) {
+          // A refresh is already running; repainting here would show state that the
+          // in-flight one is about to replace.
+          pollStatus.textContent = "Refresh already in flight — skipped this tick.";
+          return;
+        }
+        if (!resp.ok) {
+          pollStatus.textContent = "Auto-refresh failed (HTTP " + resp.status + ") — retrying.";
+          return;
+        }
+        pollStatus.textContent = "";
+        const status = await fetch("{{ url_for('api_status') }}");
+        if (status.ok) applyStatus(await status.json());
+      } catch (err) {
+        pollStatus.textContent = "Auto-refresh failed: " + err + " — retrying.";
+      }
+    }
+
+    toggle.addEventListener("change", () => {
+      if (toggle.checked) {
+        localStorage.setItem("autopoll", "on");
+        startPolling();
+      } else {
+        localStorage.removeItem("autopoll");
+        pollStatus.textContent = "";
+        stopPolling();
+      }
+    });
+
+    // Each poll opens an SSH session to the truck; there is no point paying for that
+    // while nobody is looking at the tab.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopPolling();
+      } else if (toggle.checked) {
+        startPolling();
+      }
+    });
+
+    // A manual F5 resets the checkbox — restore it from the persisted preference. The
+    // poll no longer reloads the page itself, so this now only runs on a real navigation.
+    if (localStorage.getItem("autopoll") === "on") {
+      toggle.checked = true;
+      if (!document.hidden) startPolling();
+    }
+
+    document.getElementById("grab-screenshot").addEventListener("click", async () => {
+      const shotStatus = document.getElementById("screenshot-status");
+      shotStatus.textContent = "Grabbing...";
+      try {
+        // POST captures and stores server-side; the GET below then serves those bytes,
+        // so the new image survives a page reload instead of living in a blob URL.
+        const resp = await fetch("{{ url_for('grab_screenshot') }}", { method: "POST" });
+        if (!resp.ok) {
+          shotStatus.textContent = "Failed: " + (await resp.text());
+          return;
+        }
+        // The version the server actually stored, not a guessed cache-buster: this URL
+        // names these bytes, so the browser may cache it.
+        setScreenshotSrc(resp.headers.get("X-Screenshot-Version") || Date.now());
+        shotStatus.textContent = "";
+      } catch (err) {
+        shotStatus.textContent = "Failed: " + err;
+      }
+    });
+
+    {% if marker %}
+    applyMarker({
+      lat: {{ marker.lat|tojson }}, lon: {{ marker.lon|tojson }},
+      freshness: {{ marker.freshness|tojson }},
+      label: {{ marker.label|tojson }},
+      maps_url: {{ marker.maps_url|tojson }},
+      town: {{ town|tojson }},
+    });
+    {% endif %}
+  </script>
+{% endblock %}

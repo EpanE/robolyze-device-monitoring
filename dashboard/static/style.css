@@ -219,6 +219,9 @@ main { padding: var(--space-4); max-width: 1200px; margin: 0 auto; }
 .btn-danger { color: var(--color-error-text); border-color: var(--color-error-text); }
 .btn-danger:hover { background: var(--color-error-bg); }
 
+.btn-whatsapp { background: #25D366; color: #fff; border-color: #25D366; text-decoration: none; }
+.btn-whatsapp:hover { background: #1ebe5a; }
+
 .last-refreshed, .hint { color: var(--color-neutral-600); font-size: 0.85rem; }
 
 .autopoll { display: flex; align-items: center; gap: var(--space-1); font-size: 0.85rem; color: var(--color-neutral-600); }
@@ -228,14 +231,18 @@ main { padding: var(--space-4); max-width: 1200px; margin: 0 auto; }
   display: flex; align-items: center; gap: var(--space-1);
   font-size: 0.85rem; color: var(--color-neutral-600);
 }
-.driver-field input {
+.driver-field select {
   padding: var(--space-1) var(--space-2);
   border: 1px solid var(--color-divider);
   border-radius: 0;
-  background: transparent;
-  color: var(--color-text);
+  background: #000;
+  color: #fff;
   font-size: 0.85rem;
   width: 10rem;
+}
+.driver-field select option {
+  background: #000;
+  color: #fff;
 }
 
 .map { height: 260px; width: 100%; border-radius: 0; border: 1px solid var(--color-divider); }

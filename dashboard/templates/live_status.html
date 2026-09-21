@@ -25,10 +25,19 @@
       {% endif %}
     </span>
     {# Persisted to disk (see driver.py), not in `state` — it must survive a laptop
-       restart and only ever changes when someone types a new one here. #}
+       restart and only ever changes when someone picks a new one here. Options come from
+       contacts.json (see contacts.py), not free text, so the name always matches a real
+       phone number for the WhatsApp link below. #}
     <span class="driver-field">
       Driver:
-      <input type="text" id="driver-name" value="{{ driver_name }}" placeholder="Not set">
+      <select id="driver-name">
+        <option value="" {% if not driver_name %}selected{% endif %}>Not set</option>
+        {% for c in contacts %}
+          <option value="{{ c.name }}" {% if c.name == driver_name %}selected{% endif %}>{{ c.name }}</option>
+        {% endfor %}
+      </select>
+      <a id="driver-whatsapp" class="btn btn-whatsapp" href="{{ driver_wa_link or '#' }}"
+         target="_blank" rel="noopener" {% if not driver_wa_link %}hidden{% endif %}>WhatsApp</a>
       <span id="driver-status"></span>
     </span>
   </div>
@@ -239,6 +248,10 @@
       syncCardStates();
       document.getElementById("trends").innerHTML = payload.trends_html;
       document.getElementById("report").innerHTML = payload.report_html;
+      // The <select>'s value is left alone here — same reasoning as the map's pan/zoom
+      // not being reset: don't yank a control the operator might be mid-interaction with.
+      document.getElementById("driver-whatsapp").hidden = !payload.driver_wa_link;
+      if (payload.driver_wa_link) document.getElementById("driver-whatsapp").href = payload.driver_wa_link;
       document.getElementById("last-refreshed").textContent =
         payload.last_refreshed ? "Last refreshed: " + payload.last_refreshed : "Never refreshed";
 
@@ -328,14 +341,24 @@
       if (!document.hidden) startPolling();
     }
 
-    // Saves on blur/Enter rather than per-keystroke: this is a name someone types once
-    // and leaves alone, not something that needs a request on every character.
+    // Contacts embedded once at page load rather than fetched: it's a short list that
+    // only changes when someone hand-edits contacts.json, not per-request data.
+    const CONTACTS = {{ contacts|tojson }};
     const driverInput = document.getElementById("driver-name");
     const driverStatus = document.getElementById("driver-status");
+    const driverWhatsapp = document.getElementById("driver-whatsapp");
     let savedDriverName = driverInput.value;
 
+    function updateWhatsappLink() {
+      const match = CONTACTS.find((c) => c.name === driverInput.value);
+      driverWhatsapp.hidden = !match;
+      if (match) driverWhatsapp.href = match.wa_link;
+    }
+
+    // Saves on change rather than per-keystroke: picking an option from the dropdown is
+    // already a deliberate action, unlike the free-text field this used to be.
     async function saveDriverName() {
-      const name = driverInput.value.trim();
+      const name = driverInput.value;
       if (name === savedDriverName) return;
       driverStatus.textContent = "Saving...";
       try {
@@ -355,12 +378,9 @@
       }
     }
 
-    driverInput.addEventListener("blur", saveDriverName);
-    driverInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        driverInput.blur();
-      }
+    driverInput.addEventListener("change", async () => {
+      await saveDriverName();
+      updateWhatsappLink();
     });
 
     document.getElementById("grab-screenshot").addEventListener("click", async () => {

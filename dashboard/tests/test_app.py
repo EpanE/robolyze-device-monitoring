@@ -1,13 +1,20 @@
 import datetime
+import json
 import logging
 
 import pytest
 
 import app as app_module
 import config
+import contacts
 import driver
 import geocode
 import ssh_client
+
+CONTACTS_FIXTURE = [
+    {"id": 1, "name": "Alice", "phone": "+60 11-1111111"},
+    {"id": 2, "name": "Bob", "phone": "+60 12-2222222"},
+]
 
 FAKE_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-bytes"
 
@@ -62,6 +69,9 @@ def reset_state(monkeypatch, tmp_path):
     # would both litter the working tree and leak rows into the next test's assertions.
     monkeypatch.setattr(app_module.history, "HISTORY_PATH", tmp_path / "history.jsonl")
     monkeypatch.setattr(app_module.driver, "DRIVER_PATH", tmp_path / "driver.json")
+    contacts_path = tmp_path / "contacts.json"
+    contacts_path.write_text(json.dumps(CONTACTS_FIXTURE), encoding="utf-8")
+    monkeypatch.setattr(app_module.contacts, "CONTACTS_PATH", contacts_path)
     # Refreshes now cache a live SSH session between calls, so a leftover one from the
     # previous test would make the next one skip its connect entirely.
     app_module.drop_ssh_session()
@@ -1001,6 +1011,54 @@ def test_cross_origin_driver_post_is_rejected(client):
 
     assert resp.status_code == 403
     assert driver.load_driver(path=app_module.driver.DRIVER_PATH) == ""
+
+
+def test_index_offers_a_driver_option_per_contact(client):
+    body = client.get("/").get_data(as_text=True)
+
+    assert '<option value="Alice"' in body
+    assert '<option value="Bob"' in body
+
+
+def test_selecting_a_known_driver_reveals_the_whatsapp_link(client):
+    client.post("/api/driver", data={"name": "Alice"})
+
+    body = client.get("/").get_data(as_text=True)
+
+    expected = contacts.wa_link("+60 11-1111111")
+    assert f'href="{expected}"' in body
+    assert "hidden>WhatsApp" not in body
+
+
+def test_no_driver_selected_hides_the_whatsapp_link(client):
+    body = client.get("/").get_data(as_text=True)
+
+    assert 'id="driver-whatsapp"' in body
+    assert "hidden>WhatsApp" in body
+
+
+def test_a_driver_name_not_in_contacts_hides_the_whatsapp_link(client):
+    # /api/driver still accepts any string — the dropdown constrains the UI, not the
+    # backend — but a name with no matching contact has no phone number to link to.
+    client.post("/api/driver", data={"name": "Nobody"})
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "hidden>WhatsApp" in body
+
+
+def test_status_route_carries_the_driver_wa_link(client):
+    client.post("/api/driver", data={"name": "Bob"})
+
+    payload = client.get("/api/status").get_json()
+
+    assert payload["driver_wa_link"] == contacts.wa_link("+60 12-2222222")
+
+
+def test_status_route_has_no_driver_wa_link_when_unmatched(client):
+    payload = client.get("/api/status").get_json()
+
+    assert payload["driver_wa_link"] is None
 
 
 # --- startup wiring -----------------------------------------------------------------

@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from flask import Flask, redirect, render_template, request, Response, url_for
 
 import config
+import contacts
 import driver
 import geocode
 import history
@@ -201,6 +202,17 @@ def _current_driver():
     return driver.load_driver()
 
 
+def _contacts_with_links():
+    # wa_link computed here, not in JS: contacts.json's phone formats are the one thing
+    # both the dropdown-population and the WhatsApp button need, so parse them once.
+    return [{**c, "wa_link": contacts.wa_link(c["phone"])} for c in contacts.load_contacts()]
+
+
+def _driver_wa_link(contacts_list, driver_name):
+    match = next((c for c in contacts_list if c.get("name") == driver_name), None)
+    return match["wa_link"] if match else None
+
+
 def _build_report(stale):
     """The report text for the current state, or None if there's nothing trustworthy to
     show yet. Shared by index() and api_status() so both render the exact same text."""
@@ -224,11 +236,14 @@ def index():
     # way, and one file read of a few hundred KB is nothing next to the SSH round trips.
     trends = history.build_trends(history.load())
     stale = status.is_stale(age_sec)
+    driver_name = _current_driver()
+    contacts_list = _contacts_with_links()
     return render_template(
         "live_status.html", cards=cards, state=state, marker=marker, town=_current_town(),
         stale=stale, age_sec=age_sec, trends=trends,
         pipeline_alert=status.pipeline_down_while_connected(cards, stale),
-        driver_name=_current_driver(), report_text=_build_report(stale),
+        driver_name=driver_name, report_text=_build_report(stale),
+        contacts=contacts_list, driver_wa_link=_driver_wa_link(contacts_list, driver_name),
     )
 
 
@@ -264,6 +279,7 @@ def api_status():
         "marker": marker,
         "town": _current_town(),
         "stale": stale,
+        "driver_wa_link": _driver_wa_link(_contacts_with_links(), _current_driver()),
         "last_refreshed": _format_ts(state["last_refreshed"]),
         "screenshot": (
             {"version": record["version"], "ts": _format_ts(record["ts"])} if record else None

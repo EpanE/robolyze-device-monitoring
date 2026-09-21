@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from flask import Flask, redirect, render_template, request, Response, url_for
 
 import config
+import driver
 import geocode
 import history
 import logging_setup
@@ -50,6 +51,10 @@ def new_state():
         # About the last *attempt*, not the stored image — a failed grab deliberately keeps
         # the previous capture, so these two do not move together.
         "screenshot_error": None,
+        # Set once a reboot command has been sent; cleared by the next refresh that
+        # manages to open an SSH session again -- that is what "back up" means here, not
+        # any particular health.json content.
+        "rebooting": False,
     }
 
 
@@ -189,6 +194,27 @@ def _store_screenshot(png_bytes):
     }
 
 
+def _current_driver():
+    # Read from disk per request rather than held in memory: it survives a restart that
+    # way, same reasoning as history.load() below, and it only ever changes on a manual
+    # edit via /api/driver.
+    return driver.load_driver()
+
+
+def _build_report(stale):
+    """The report text for the current state, or None if there's nothing trustworthy to
+    show yet. Shared by index() and api_status() so both render the exact same text."""
+    # A stale snapshot is withheld rather than rendered: this report gets copied into
+    # WhatsApp and signed off, so a "✅ System running" line read off a frozen file is
+    # worse than no report at all.
+    if state["health"] is None or stale:
+        return None
+    return report.build_report(
+        state["health"], config.DEFAULT_CONFIDENCE_THRESHOLD, datetime.date.today(),
+        town=_current_town(), driver_name=_current_driver(),
+    )
+
+
 @app.route("/")
 def index():
     age_sec = state["health_age_sec"]
@@ -197,9 +223,12 @@ def index():
     # Read from disk per request rather than held in memory: it survives a restart that
     # way, and one file read of a few hundred KB is nothing next to the SSH round trips.
     trends = history.build_trends(history.load())
+    stale = status.is_stale(age_sec)
     return render_template(
         "live_status.html", cards=cards, state=state, marker=marker, town=_current_town(),
-        stale=status.is_stale(age_sec), age_sec=age_sec, trends=trends,
+        stale=stale, age_sec=age_sec, trends=trends,
+        pipeline_alert=status.pipeline_down_while_connected(cards, stale),
+        driver_name=_current_driver(), report_text=_build_report(stale),
     )
 
 
@@ -225,9 +254,13 @@ def api_status():
     record = state["screenshot"]
 
     return {
-        "banners_html": render_template("_banners.html", state=state, stale=stale, age_sec=age_sec),
+        "banners_html": render_template(
+            "_banners.html", state=state, stale=stale, age_sec=age_sec,
+            pipeline_alert=status.pipeline_down_while_connected(cards, stale),
+        ),
         "cards_html": render_template("_cards.html", cards=cards),
         "trends_html": render_template("_trends.html", trends=history.build_trends(history.load())),
+        "report_html": render_template("_report.html", report_text=_build_report(stale), stale=stale),
         "marker": marker,
         "town": _current_town(),
         "stale": stale,
@@ -243,21 +276,13 @@ def _format_ts(value):
     return value.strftime("%Y-%m-%d %H:%M:%S") if value else None
 
 
-@app.route("/report")
-def daily_report():
-    report_text = None
-    # A stale snapshot is withheld rather than rendered: this report gets copied into
-    # WhatsApp and signed off, so a "✅ System running" line read off a frozen file is
-    # worse than no report at all.
-    stale = status.is_stale(state["health_age_sec"])
-    if state["health"] is not None and not stale:
-        report_text = report.build_report(
-            state["health"], config.DEFAULT_CONFIDENCE_THRESHOLD, datetime.date.today(), town=_current_town()
-        )
-    return render_template(
-        "daily_report.html", report_text=report_text, state=state,
-        stale=stale, age_sec=state["health_age_sec"],
-    )
+@app.route("/api/driver", methods=["POST"])
+def set_driver():
+    """Persist the driver's name. No SSH involved — covered by the auth/origin guard
+    like every other POST here, but it never touches the truck."""
+    name = request.form.get("name", "").strip()
+    driver.save_driver(name)
+    return {"status": "ok", "name": name}
 
 
 def _fix_timestamp(gps, now):
@@ -355,6 +380,10 @@ def _do_refresh():
         # reaches this file.
         log.exception("SSH connect to %s failed", config.SSH_HOST)
         return
+
+    # A live SSH session is what "back up" means here -- independent of whether the
+    # commands below succeed.
+    state["rebooting"] = False
 
     # Set by any command that fails below. A command failing on a link the transport still
     # calls alive is the ambiguous case: reconnecting costs one handshake, whereas reusing
@@ -497,6 +526,39 @@ def _do_screenshot():
     # capture uncacheable.
     resp.headers["X-Screenshot-Version"] = state["screenshot"]["version"]
     return resp
+
+
+@app.route("/api/reboot", methods=["POST"])
+def reboot():
+    if not _ssh_lock.acquire(blocking=False):
+        return Response("another SSH request is in flight, try again", status=503, mimetype="text/plain")
+    try:
+        return _do_reboot()
+    finally:
+        _ssh_lock.release()
+
+
+def _do_reboot():
+    try:
+        client = _ssh_session_for_use()
+    except Exception as exc:
+        state["connection_error"] = str(exc)
+        drop_ssh_session()
+        log.exception("SSH connect to %s failed for a reboot", config.SSH_HOST)
+        return Response(str(exc), status=502, mimetype="text/plain")
+
+    try:
+        ssh_client.reboot_device(client, config.SSH_PASSWORD)
+    except Exception as exc:
+        log.exception("reboot command failed")
+        return Response(str(exc), status=502, mimetype="text/plain")
+    finally:
+        # Whether the Pi is now rebooting or the connection merely dropped mid-command,
+        # the cached session no longer points at a machine worth reusing.
+        drop_ssh_session()
+
+    state["rebooting"] = True
+    return {"status": "ok", "message": "Reboot sent"}
 
 
 def create_app():

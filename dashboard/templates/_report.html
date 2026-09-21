@@ -1,0 +1,28 @@
+{# The page and the 30s poll both render this (see api_status()'s report_html), so a
+   refresh keeps the report text in sync without a full page reload. #}
+{% if report_text %}
+  <p class="hint">
+    Auto-filled lines come straight from the latest refresh. Manual lines (Location,
+    sync/recording status) are left as-is below — edit them directly before copying to
+    WhatsApp. Driver is filled in from the field above.
+  </p>
+  <textarea id="report-text" class="report-textarea" rows="26" spellcheck="false">{{ report_text }}</textarea>
+  <div class="toolbar">
+    {# Click handling lives in live_status.html's delegated listener on #report, not
+       here: this partial's innerHTML is replaced wholesale on every poll (like
+       #card-grid), and a <script> tag injected via innerHTML never executes. #}
+    <button type="button" id="copy-report" class="btn btn-primary">Copy to Clipboard</button>
+    <span id="copy-status"></span>
+  </div>
+{% elif stale %}
+  <p class="hint">
+    No report generated — the snapshot backing it is stale (see the banner above). Fix
+    <code>health-agent.service</code> on the Pi and refresh; a report filled in from a
+    frozen file would be signed off and believed.
+  </p>
+{% else %}
+  <p class="hint">
+    No health data yet. Click <strong>Refresh Now</strong> above to pull the latest
+    snapshot from the Pi before generating a report.
+  </p>
+{% endif %}

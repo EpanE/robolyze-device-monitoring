@@ -87,7 +87,7 @@ sharing with others):
 .venv/bin/python app.py --dev       # macOS/Linux
 ```
 
-Click **Refresh Now** on the Live Status tab to pull a fresh snapshot —
+Click **Refresh Now** on the Live Status page to pull a fresh snapshot —
 nothing auto-fetches on page load.
 
 **Offline starts work.** The launcher only runs `pip install` when the pinned
@@ -180,8 +180,22 @@ renders a banner and leaves **Refresh Now** clickable:
 - **No internet**: Leaflet is vendored in `static/vendor/leaflet`, so the map
   still initialises — but OSM tiles come from the network, so the marker will
   sit on a blank grid.
-- **No health data at all**: the Daily Report tab prompts to refresh instead of
+- **No health data at all**: the Daily Report section prompts to refresh instead of
   rendering a broken report.
+
+## Reboot Device
+
+The **Danger Zone** panel on the Live Status page power-cycles the Pi (`sudo
+reboot` over the same SSH connection, piped the `SSH_PASSWORD` from `.env` --
+no separate sudoers setup needed). It asks for confirmation first: active
+recording is interrupted, and the truck takes a couple of minutes to come back
+on Tailscale.
+
+The Pi tears the SSH session down almost the instant the command actually
+runs, before a reply can come back -- that disconnect is treated as success,
+not a failure. A warning banner ("Device is rebooting...") stays up until the
+next refresh manages to open a fresh SSH session, which is what "back up"
+means here.
 
 ## What a refresh costs
 
@@ -211,7 +225,7 @@ operator's pan and zoom survive a tick, which a full reload destroyed.
 
 Every successful refresh appends one JSON line to `logs/history.jsonl`: fps,
 heartbeat age, CPU temp, disk used, upload queue depth, dropped total, speed, and
-the snapshot age. The Live Status tab draws each as a sparkline.
+the snapshot age. The Live Status page draws each as a sparkline.
 
 This exists because every other part of this page answers "is it broken" and none
 of them answer "since when" — which is the question actually asked afterwards. Did

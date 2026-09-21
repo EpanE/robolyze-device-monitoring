@@ -5,6 +5,7 @@ import pytest
 
 import app as app_module
 import config
+import driver
 import geocode
 import ssh_client
 
@@ -60,6 +61,7 @@ def reset_state(monkeypatch, tmp_path):
     # trend row, so without this every test writing to the repo's own logs/history.jsonl
     # would both litter the working tree and leak rows into the next test's assertions.
     monkeypatch.setattr(app_module.history, "HISTORY_PATH", tmp_path / "history.jsonl")
+    monkeypatch.setattr(app_module.driver, "DRIVER_PATH", tmp_path / "driver.json")
     # Refreshes now cache a live SSH session between calls, so a leftover one from the
     # previous test would make the next one skip its connect entirely.
     app_module.drop_ssh_session()
@@ -114,18 +116,18 @@ def test_refresh_handles_partial_failure_without_crashing(client, monkeypatch):
     assert app_module.state["tailscale"] == HEALTHY_TAILSCALE
 
 
-def test_report_route_prompts_refresh_when_no_data(client):
-    resp = client.get("/report")
+def test_index_prompts_refresh_for_the_report_when_no_data(client):
+    resp = client.get("/")
     assert resp.status_code == 200
-    assert b"Refresh" in resp.data
+    assert b"No health data yet" in resp.data
 
 
-def test_report_route_renders_report_after_refresh(client, monkeypatch):
+def test_index_renders_the_report_after_refresh(client, monkeypatch):
     monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
     monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
     client.post("/api/refresh")
 
-    resp = client.get("/report")
+    resp = client.get("/")
     assert resp.status_code == 200
     assert "Robolyze Daily Ops Update".encode() in resp.data
     assert "Confidence threshold set to 0.75".encode() in resp.data
@@ -402,9 +404,9 @@ def test_refresh_still_returns_to_the_page_it_came_from(client, monkeypatch):
     monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
     monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
 
-    resp = client.post("/api/refresh", headers={"Referer": "http://localhost/report"})
+    resp = client.post("/api/refresh", headers={"Referer": "http://localhost/some-other-page"})
 
-    assert resp.headers["Location"].endswith("/report")
+    assert resp.headers["Location"].endswith("/some-other-page")
 
 
 def test_screenshot_version_survives_a_restart_without_reusing_a_cached_url(client, monkeypatch):
@@ -536,14 +538,14 @@ def test_a_dropped_poll_is_reported_as_409_rather_than_looking_like_success(clie
 def test_a_dropped_form_refresh_tells_the_operator_it_was_skipped(client):
     app_module._ssh_lock.acquire()
     try:
-        resp = client.post("/api/refresh", headers={"Referer": "http://localhost/report"})
+        resp = client.post("/api/refresh", headers={"Referer": "http://localhost/"})
     finally:
         app_module._ssh_lock.release()
 
     assert resp.status_code == 302
     assert "refresh=skipped" in resp.headers["Location"]
 
-    body = client.get("/report?refresh=skipped").get_data(as_text=True)
+    body = client.get("/?refresh=skipped").get_data(as_text=True)
     assert "Refresh skipped" in body
 
 
@@ -667,6 +669,40 @@ def test_fresh_snapshot_renders_no_stale_banner(client, monkeypatch):
     assert b"44.6" in resp.data
 
 
+def test_dead_pipeline_with_fresh_snapshot_renders_a_banner(client, monkeypatch):
+    # SSH and health-agent are both fine (fresh snapshot) but detection.py itself
+    # isn't running — this must not be silent just because the stale banner doesn't fire.
+    dead_pipeline_health = {**HEALTHY_HEALTH, "pipeline": {"ok": False, "error": "not running"}}
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (dead_pipeline_health, 12.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    resp = client.get("/")
+
+    assert b"Detection pipeline is not running" in resp.data
+
+
+def test_healthy_pipeline_renders_no_pipeline_banner(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 12.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    resp = client.get("/")
+
+    assert b"Detection pipeline is not running" not in resp.data
+
+
+def test_dead_pipeline_banner_also_appears_in_api_status(client, monkeypatch):
+    dead_pipeline_health = {**HEALTHY_HEALTH, "pipeline": {"ok": False, "error": "not running"}}
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (dead_pipeline_health, 12.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    resp = client.get("/api/status")
+
+    assert "Detection pipeline is not running" in resp.get_json()["banners_html"]
+
+
 def test_failed_health_read_clears_the_stale_age(client, monkeypatch):
     # Otherwise the age from the last good refresh outlives the snapshot it described and
     # keeps colouring a page that no longer has any snapshot at all.
@@ -690,7 +726,7 @@ def test_report_refuses_to_generate_from_a_stale_snapshot(client, monkeypatch):
     monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
     client.post("/api/refresh")
 
-    resp = client.get("/report")
+    resp = client.get("/")
 
     assert b"System running" not in resp.data
 
@@ -811,6 +847,162 @@ def test_manual_grab_reports_the_version_it_stored(client, monkeypatch):
     assert resp.headers["X-Screenshot-Version"] == app_module.state["screenshot"]["version"]
 
 
+# --- reboot ---------------------------------------------------------------------------
+
+
+def test_reboot_route_sends_the_command_and_reports_ok(client, monkeypatch):
+    sent = []
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: sent.append(pw))
+
+    resp = client.post("/api/reboot")
+
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "ok"
+    assert sent == [config.SSH_PASSWORD]
+
+
+def test_reboot_route_returns_502_on_failure(client, monkeypatch):
+    def boom(c, pw):
+        raise ssh_client.SSHCommandError("reboot failed: Sorry, try again.")
+
+    monkeypatch.setattr(ssh_client, "reboot_device", boom)
+
+    resp = client.post("/api/reboot")
+
+    assert resp.status_code == 502
+    assert b"Sorry, try again" in resp.data
+
+
+def test_reboot_route_returns_502_when_ssh_cannot_connect(client, monkeypatch):
+    def refuse(*a, **k):
+        raise OSError("No route to host")
+
+    monkeypatch.setattr(ssh_client, "connect", refuse)
+
+    resp = client.post("/api/reboot")
+
+    assert resp.status_code == 502
+    assert b"No route to host" in resp.data
+
+
+def test_reboot_marks_state_as_rebooting(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+
+    client.post("/api/reboot")
+
+    assert app_module.state["rebooting"] is True
+
+
+def test_reboot_drops_the_cached_ssh_session(client, monkeypatch):
+    # The Pi is going down (or already gone) — the cached session, if it survived the
+    # call at all, no longer points at a machine worth reusing.
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+
+    client.post("/api/reboot")
+
+    assert app_module._ssh_session is None
+
+
+def test_a_successful_refresh_after_reboot_clears_the_rebooting_flag(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+    client.post("/api/reboot")
+    assert app_module.state["rebooting"] is True
+
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    client.post("/api/refresh")
+
+    assert app_module.state["rebooting"] is False
+
+
+def test_reboot_banner_appears_while_rebooting(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+    client.post("/api/reboot")
+
+    resp = client.get("/")
+
+    assert b"rebooting" in resp.data
+
+
+def test_concurrent_reboot_is_rejected_rather_than_queued(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+
+    app_module._ssh_lock.acquire()
+    try:
+        resp = client.post("/api/reboot")
+    finally:
+        app_module._ssh_lock.release()
+
+    assert resp.status_code == 503
+
+
+def test_cross_origin_reboot_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "reboot_device", lambda c, pw: None)
+
+    resp = client.post("/api/reboot", headers={"Origin": "http://evil.example"})
+
+    assert resp.status_code == 403
+
+
+# --- driver name ----------------------------------------------------------------------
+
+
+def test_set_driver_persists_the_name(client):
+    resp = client.post("/api/driver", data={"name": "Alice"})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"status": "ok", "name": "Alice"}
+    assert driver.load_driver(path=app_module.driver.DRIVER_PATH) == "Alice"
+
+
+def test_driver_name_survives_a_restart(client):
+    # The whole point: a fresh process (new_state()) must still see it, since it lives on
+    # disk rather than in `state`.
+    client.post("/api/driver", data={"name": "Alice"})
+
+    app_module.state = app_module.new_state()
+
+    resp = client.get("/")
+    assert b"Alice" in resp.data
+
+
+def test_setting_the_driver_name_requires_a_manual_edit_not_a_refresh(client, monkeypatch):
+    client.post("/api/driver", data={"name": "Alice"})
+
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    client.post("/api/refresh")
+
+    resp = client.get("/")
+    assert b"Alice" in resp.data
+
+
+def test_driver_name_fills_in_the_report_line(client, monkeypatch):
+    client.post("/api/driver", data={"name": "Alice"})
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    client.post("/api/refresh")
+
+    body = client.get("/").get_data(as_text=True)
+
+    assert "Driver : _Alice_" in body
+
+
+def test_driver_route_requires_auth_when_configured(client, monkeypatch):
+    monkeypatch.setattr(config, "DASHBOARD_PASSWORD", "s3cret")
+
+    assert client.post("/api/driver", data={"name": "Alice"}).status_code == 401
+
+
+def test_cross_origin_driver_post_is_rejected(client):
+    resp = client.post(
+        "/api/driver", data={"name": "Alice"}, headers={"Origin": "http://evil.example"}
+    )
+
+    assert resp.status_code == 403
+    assert driver.load_driver(path=app_module.driver.DRIVER_PATH) == ""
+
+
 # --- startup wiring -----------------------------------------------------------------
 
 
@@ -892,6 +1084,7 @@ def test_auth_also_guards_the_ssh_routes(client, monkeypatch):
 
     assert client.post("/api/refresh").status_code == 401
     assert client.post("/api/screenshot").status_code == 401
+    assert client.post("/api/reboot").status_code == 401
 
 
 def test_cross_origin_post_is_rejected(client, monkeypatch):
@@ -980,9 +1173,9 @@ def test_refresh_returns_to_the_page_it_came_from(client, monkeypatch):
     monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
     monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
 
-    resp = client.post("/api/refresh", headers={"Referer": "http://localhost/report"})
+    resp = client.post("/api/refresh", headers={"Referer": "http://localhost/some-other-page"})
 
-    assert resp.headers["Location"].endswith("/report")
+    assert resp.headers["Location"].endswith("/some-other-page")
 
 
 # --- SSH connection reuse -----------------------------------------------------------
@@ -1120,6 +1313,9 @@ def test_status_route_returns_rendered_fragments(client, monkeypatch):
     assert "Pipeline" in payload["cards_html"]
     assert "44.6" in payload["cards_html"]
     assert payload["last_refreshed"] is not None
+    # Guards the poll's contract with the client-side collapse state in live_status.html
+    # (see cardOverrides / syncCardStates) — it keys off this attribute by card name.
+    assert 'data-card="Pipeline"' in payload["cards_html"]
 
 
 def test_status_route_reports_banners(client, monkeypatch):
@@ -1150,6 +1346,16 @@ def test_status_route_carries_the_screenshot_version(client, monkeypatch):
     payload = client.get("/api/status").get_json()
 
     assert payload["screenshot"]["version"] == app_module.state["screenshot"]["version"]
+
+
+def test_status_route_carries_the_report(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 0.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    client.post("/api/refresh")
+
+    payload = client.get("/api/status").get_json()
+
+    assert "Robolyze Daily Ops Update" in payload["report_html"]
 
 
 def test_status_route_is_empty_before_any_refresh(client):

@@ -11,6 +11,7 @@ from ssh_client import (
     fetch_health_snapshot,
     fetch_tailscale_status,
     grab_screenshot,
+    reboot_device,
 )
 
 
@@ -310,3 +311,110 @@ def test_is_alive_follows_the_transport():
 
     assert ssh_client_module.is_alive(Client(True)) is True
     assert ssh_client_module.is_alive(Client(False)) is False
+
+
+# --- reboot ---------------------------------------------------------------------------
+# The Pi tears the SSH session down almost the instant `reboot` actually runs — often
+# before the exit status, or even the rest of stderr, can be read back. That is the
+# expected, successful case here, not a failure: only a rejection that arrives *before*
+# the connection dies (e.g. a wrong sudo password) is a real error.
+
+
+class FakeRebootChannel:
+    def __init__(self, exit_status=0):
+        self._exit_status = exit_status
+
+    def recv_exit_status(self):
+        return self._exit_status
+
+
+class FakeRebootStream:
+    def __init__(self, data=b"", exit_status=0, raises_on_read=None):
+        self._data = data
+        self._raises_on_read = raises_on_read
+        self.channel = FakeRebootChannel(exit_status)
+
+    def read(self):
+        if self._raises_on_read is not None:
+            raise self._raises_on_read
+        return self._data
+
+
+class FakeRebootStdin:
+    def __init__(self, raises=None):
+        self.written = ""
+        self._raises = raises
+
+    def write(self, data):
+        if self._raises is not None:
+            raise self._raises
+        self.written += data
+
+    def flush(self):
+        pass
+
+
+class FakeRebootClient:
+    """Test double for the slice of paramiko's interface reboot_device uses: a three-stream
+    exec_command result, with the stdin/stdout/stderr streams independently swappable so a
+    failure can be injected at exactly the point the real connection would drop."""
+
+    def __init__(self, stdin=None, stdout=None, stderr=None, raises=None):
+        self.stdin = stdin if stdin is not None else FakeRebootStdin()
+        self.stdout = stdout if stdout is not None else FakeRebootStream()
+        self.stderr = stderr if stderr is not None else FakeRebootStream()
+        self._raises = raises
+        self.last_command = None
+        self.last_timeout = None
+
+    def exec_command(self, command, timeout=None):
+        self.last_command = command
+        self.last_timeout = timeout
+        if self._raises is not None:
+            raise self._raises
+        return self.stdin, self.stdout, self.stderr
+
+
+def test_reboot_device_runs_sudo_reboot():
+    client = FakeRebootClient()
+    reboot_device(client, "pw")
+    assert client.last_command == "sudo -S reboot"
+
+
+def test_reboot_device_writes_the_sudo_password_to_stdin():
+    client = FakeRebootClient()
+    reboot_device(client, "s3cret")
+    assert client.stdin.written == "s3cret\n"
+
+
+def test_reboot_device_treats_a_dropped_connection_as_success():
+    stderr = FakeRebootStream(raises_on_read=EOFError())
+    client = FakeRebootClient(stderr=stderr)
+    reboot_device(client, "pw")  # must not raise
+
+
+def test_reboot_device_treats_a_reset_connection_as_success():
+    stderr = FakeRebootStream(
+        raises_on_read=ConnectionResetError(10054, "forcibly closed")
+    )
+    client = FakeRebootClient(stderr=stderr)
+    reboot_device(client, "pw")  # must not raise
+
+
+def test_reboot_device_raises_when_exec_command_itself_fails():
+    # The command never even reached the Pi — a genuine failure, distinct from the
+    # connection dropping after `reboot` was already sent.
+    client = FakeRebootClient(raises=paramiko.SSHException("no session"))
+    with pytest.raises(SSHCommandError, match="SSH connection lost"):
+        reboot_device(client, "pw")
+
+
+def test_reboot_device_raises_on_a_rejected_sudo_password():
+    # A wrong password is rejected *before* the connection drops — exit 1, sudo's own
+    # message on stderr — and that must surface as a real failure, not be swallowed as
+    # the expected post-reboot disconnect.
+    stdout = FakeRebootStream(exit_status=1)
+    stderr = FakeRebootStream(data=b"Sorry, try again.\nsudo: 1 incorrect password attempt")
+    client = FakeRebootClient(stdout=stdout, stderr=stderr)
+    with pytest.raises(SSHCommandError, match="incorrect password"):
+        reboot_device(client, "wrong")

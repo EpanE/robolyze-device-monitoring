@@ -1,10 +1,32 @@
-{# Shared by the full page and the poll's fragment response — see _banners.html. #}
+{# Shared by the full page and the poll's fragment response — see _banners.html.
+   Collapse/expand is purely client-side (see live_status.html's cardOverrides) — the
+   server always renders every card's full content; data-default-expanded just tells the
+   client which state to start a card in the first time it sees that name. #}
 {% for card in cards %}
-  <div class="card {{ card.css_class }}">
-    <div class="card-header">
+  <div class="card blueprint {{ card.css_class }}" data-card="{{ card.name }}"
+       data-default-expanded="{{ 'true' if card.ok is not sameas true else 'false' }}">
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+    <button type="button" class="card-header" aria-expanded="false">
       <span class="card-emoji">{{ card.emoji }}</span>
       <span class="card-name">{{ card.name }}</span>
+      {% if card.badge %}
+        <span class="card-badge {{ card.badge.css_class }}">{{ card.badge.emoji }} {{ card.badge.text }}</span>
+      {% endif %}
+      <svg class="card-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"></path></svg>
+    </button>
+    <div class="card-body">
+      {% if card.rows %}
+        <div class="card-rows">
+          {% for row in card.rows %}
+            <div class="card-row-label">{{ row.label }}</div>
+            <div class="card-row-value {{ 'alert' if row.alert else '' }}">{{ row.value }}</div>
+          {% endfor %}
+        </div>
+        <div class="card-raw">{{ card.detail }}</div>
+      {% else %}
+        <p class="card-sentence {{ 'alert' if card.ok is sameas false else '' }}">{{ card.detail }}</p>
+      {% endif %}
     </div>
-    <div class="card-detail">{{ card.detail }}</div>
   </div>
 {% endfor %}

@@ -9,11 +9,10 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>🚛 Duromac Truck Monitor</h1>
-    <nav class="tabs">
-      <a class="tab {{ 'active' if active == 'live' else '' }}" href="{{ url_for('index') }}">Live Status</a>
-      <a class="tab {{ 'active' if active == 'report' else '' }}" href="{{ url_for('daily_report') }}">Daily Report</a>
-    </nav>
+    <div class="topbar-row">
+      <h1>🚛 Duromac Truck Monitor</h1>
+    </div>
+    {% block header_toolbar %}{% endblock %}
   </header>
 
   <div id="banners">{% include "_banners.html" %}</div>

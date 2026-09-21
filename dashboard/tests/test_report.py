@@ -48,21 +48,39 @@ def test_camera_not_checked_flags_both_camera_lines_never_silent_ok():
     health = {**HEALTHY, "camera": {"clarity": {"checked": False, "clear": True}}}
     report = build_report(health, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
     assert "🔴 Duromac feed inspected" in report
-    assert "🔴 Camera feed is clear" in report
+    assert "🔴 Camera feed clarity not checked" in report
 
 
 def test_camera_checked_but_not_clear_flags_only_clarity_line():
     health = {**HEALTHY, "camera": {"clarity": {"checked": True, "clear": False}}}
     report = build_report(health, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
     assert "✅ Duromac feed inspected" in report
-    assert "🔴 Camera feed is clear" in report
+    assert "🔴 Camera feed is NOT clear — check lens" in report
 
 
 def test_camera_missing_clarity_block_treated_as_not_inspected():
     health = {**HEALTHY, "camera": {}}
     report = build_report(health, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
     assert "🔴 Duromac feed inspected" in report
-    assert "🔴 Camera feed is clear" in report
+    assert "🔴 Camera feed clarity not checked" in report
+
+
+def test_camera_clarity_emoji_and_text_never_contradict():
+    # The bug: emoji correctly flipped red on unclear/unchecked, but the sentence
+    # was a hardcoded literal that always said "is clear" regardless of state.
+    cases = [
+        (True, True, "✅ Camera feed is clear"),
+        (True, False, "🔴 Camera feed is NOT clear — check lens"),
+        (False, True, "🔴 Camera feed clarity not checked"),
+        (False, False, "🔴 Camera feed clarity not checked"),
+    ]
+    for checked, clear, expected in cases:
+        health = {**HEALTHY, "camera": {"clarity": {"checked": checked, "clear": clear}}}
+        report = build_report(health, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
+        assert expected in report, f"checked={checked} clear={clear}: expected {expected!r}"
+        # No other emoji may prefix this specific sentence text.
+        other_emoji = "🔴" if expected.startswith("✅") else "✅"
+        assert f"{other_emoji} {expected[2:]}" not in report
 
 
 def test_disk_alert_flags_storage_line():
@@ -83,16 +101,18 @@ def test_confidence_falls_back_to_default_when_pipeline_not_running():
     assert "Confidence threshold set to 0.75 ✓" in report
 
 
-def test_gating_logic_is_a_manual_placeholder_not_a_silent_checkmark():
+def test_gating_logic_is_always_a_green_tick():
+    # No sensor drives this line — it can only change if the code itself changes, so it's
+    # a hardcoded checkmark rather than a manual "confirm yourself" placeholder.
     report = build_report(HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
-    assert "✅ Gating logic active" not in report
-    assert "__ Gating logic active" in report
+    assert "✅ Gating logic active" in report
+    assert "__ Gating logic active" not in report
 
 
 def test_manual_fields_and_whatsapp_formatting_preserved_verbatim():
     report = build_report(HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28))
     assert "*📍 Location : _{Location}_*" in report
-    assert "*🚛 Driver : _{name}_*" in report
+    assert "*🚛 Driver : _{Driver}_*" in report
     assert "⏸️ Sync script run - stoped" in report
     assert "⏸️ recording/ - pause when needed or prompt" in report
     assert "⏸️ Recording - pause when needed or prompt" in report
@@ -109,6 +129,24 @@ def test_town_prefills_location_line_when_provided():
 def test_town_defaults_to_manual_placeholder_when_not_provided():
     report = build_report(HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28), town=None)
     assert "*📍 Location : _{Location}_*" in report
+
+
+def test_driver_name_prefills_the_driver_line_when_provided():
+    report = build_report(
+        HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28), driver_name="Alice"
+    )
+    assert "*🚛 Driver : _Alice_*" in report
+    assert "{Driver}" not in report
+
+
+def test_driver_name_defaults_to_manual_placeholder_when_not_provided():
+    report = build_report(HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28), driver_name=None)
+    assert "*🚛 Driver : _{Driver}_*" in report
+
+
+def test_driver_name_defaults_to_manual_placeholder_when_empty():
+    report = build_report(HEALTHY, DEFAULT_CONFIDENCE, datetime.date(2026, 7, 28), driver_name="")
+    assert "*🚛 Driver : _{Driver}_*" in report
 
 
 def test_null_confidence_falls_back_to_the_configured_default():

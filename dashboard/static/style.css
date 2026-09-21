@@ -1,21 +1,108 @@
 :root {
   color-scheme: light dark;
-  --bg: #f4f5f7;
-  --card-bg: #ffffff;
-  --text: #1a1d21;
-  --muted: #6b7280;
-  --border: #e2e4e9;
-  --accent: #2563eb;
+
+  --color-bg: #f2f2f3;
+  --color-surface: #e9e9ea;
+  --color-text: #1d1f20;
+  --color-accent: #5980a6;
+  --color-divider: color-mix(in srgb, var(--color-text) 16%, transparent);
+
+  /* Tonal ramps — same lightness scale per role, so e.g. neutral-600 and
+     accent-600 read as the same visual weight. */
+  --color-neutral-100: #f5f5f8;
+  --color-neutral-200: #e7e7ea;
+  --color-neutral-300: #d4d4d7;
+  --color-neutral-400: #b7b7ba;
+  --color-neutral-500: #98989b;
+  --color-neutral-600: #7a7a7d;
+  --color-neutral-700: #5d5d60;
+  --color-neutral-800: #424244;
+  --color-neutral-900: #2b2b2d;
+
+  --color-accent-100: #eef6ff;
+  --color-accent-200: #d6ebff;
+  --color-accent-300: #b5d9fd;
+  --color-accent-400: #94bce3;
+  --color-accent-500: #749dc4;
+  --color-accent-600: #597ea3;
+  --color-accent-700: #416180;
+  --color-accent-800: #2c455d;
+  --color-accent-900: #1d2d3d;
+
+  /* Semantic status colors — not part of the wireframe system itself (it's
+     monochrome steel-blue), added as tokens so every rule references one
+     of these rather than a scattered literal hex. */
+  --color-ok: #5c8a6a;
+  --color-bad: #b0524a;
+  --color-unknown: var(--color-neutral-500);
+  --color-warn-bg: #f4e9d4;
+  --color-warn-text: #7a5a1e;
+  --color-error-bg: #f8e3e1;
+  --color-error-text: #7a2e26;
+
+  /* No webfont: this dashboard runs on a truck with no reliable internet
+     (see the vendored-Leaflet comment in live_status.html) — the condensed
+     heading look is approximated with weight + letter-spacing instead. */
+  --font-heading: system-ui, sans-serif;
+  --font-heading-weight: 600;
+  --font-body: system-ui, sans-serif;
+
+  --space-1: 3.4px;
+  --space-2: 6.8px;
+  --space-3: 10.2px;
+  --space-4: 13.6px;
+  --space-6: 20.4px;
+  --space-8: 27.2px;
+
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 7px;
+
+  --shadow-sm: 0 1px 2px color-mix(in srgb, #2b2b2d 14%, transparent);
+  --shadow-md: 0 3px 10px color-mix(in srgb, #2b2b2d 16%, transparent);
+  --shadow-lg: 0 12px 32px color-mix(in srgb, #2b2b2d 22%, transparent);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14161a;
-    --card-bg: #1e2126;
-    --text: #e8eaed;
-    --muted: #9aa0a6;
-    --border: #2c2f36;
-    --accent: #5b9dff;
+    --color-bg: #14161a;
+    --color-surface: #1e2126;
+    --color-text: #e8eaed;
+    --color-accent: var(--color-accent-500);
+
+    /* Ramps reversed rather than re-derived: the lightest light-mode step
+       becomes the step nearest the (now dark) ground, keeping each step's
+       relative visual weight the same on either background. */
+    --color-neutral-100: #2b2b2d;
+    --color-neutral-200: #424244;
+    --color-neutral-300: #5d5d60;
+    --color-neutral-400: #7a7a7d;
+    --color-neutral-500: #98989b;
+    --color-neutral-600: #b7b7ba;
+    --color-neutral-700: #d4d4d7;
+    --color-neutral-800: #e7e7ea;
+    --color-neutral-900: #f5f5f8;
+
+    --color-accent-100: #1d2d3d;
+    --color-accent-200: #2c455d;
+    --color-accent-300: #416180;
+    --color-accent-400: #597ea3;
+    --color-accent-500: #749dc4;
+    --color-accent-600: #94bce3;
+    --color-accent-700: #b5d9fd;
+    --color-accent-800: #d6ebff;
+    --color-accent-900: #eef6ff;
+
+    --color-ok: #7fae8c;
+    --color-bad: #d98d84;
+    --color-warn-bg: #3a2f14;
+    --color-warn-text: #f0c785;
+    --color-error-bg: #3a1f1c;
+    --color-error-text: #f2a79c;
+
+    --shadow-sm: 0 1px 2px color-mix(in srgb, #000 40%, transparent);
+    --shadow-md: 0 3px 10px color-mix(in srgb, #000 45%, transparent);
+    --shadow-lg: 0 12px 32px color-mix(in srgb, #000 55%, transparent);
   }
 }
 
@@ -23,151 +110,246 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-  background: var(--bg);
-  color: var(--text);
+  font-family: var(--font-body);
+  background: var(--color-bg);
+  color: var(--color-text);
 }
 
+/* — blueprint frame: the wireframe registration marks worn by every card
+     and panel — square, transparent, hairline-bordered — */
+.blueprint { position: relative; }
+.blueprint > .corner {
+  position: absolute; width: 11px; height: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.blueprint > .corner::before, .blueprint > .corner::after {
+  content: ""; position: absolute; background: currentColor;
+}
+.blueprint > .corner::before { left: 5px; top: 0; width: 1px; height: 100%; }
+.blueprint > .corner::after  { top: 5px; left: 0; width: 100%; height: 1px; }
+.blueprint > .corner.tl { top: -6px; left: -6px; }
+.blueprint > .corner.tr { top: -6px; right: -6px; }
+.blueprint > .corner.bl { bottom: -6px; left: -6px; }
+.blueprint > .corner.br { bottom: -6px; right: -6px; }
+
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-divider);
+  box-shadow: var(--shadow-sm);
+}
+
+.topbar-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--card-bg);
+  padding: var(--space-3) var(--space-4);
   flex-wrap: wrap;
-  gap: 0.75rem;
+  gap: var(--space-3);
 }
 
-.topbar h1 { font-size: 1.1rem; margin: 0; }
-
-.tabs { display: flex; gap: 0.5rem; }
-
-.tab {
-  padding: 0.4rem 0.9rem;
-  border-radius: 6px;
-  text-decoration: none;
-  color: var(--muted);
-  font-weight: 600;
-  font-size: 0.9rem;
+.topbar h1 {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 1.2rem; margin: 0; letter-spacing: -0.01em;
 }
 
-.tab.active { background: var(--accent); color: #fff; }
+.header-toolbar {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: 0 var(--space-4) var(--space-3);
+  flex-wrap: wrap;
+}
 
-main { padding: 1.5rem; max-width: 960px; margin: 0 auto; }
+main { padding: var(--space-4); max-width: 1200px; margin: 0 auto; }
+
+.live-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.status-col, .side-col { display: flex; flex-direction: column; gap: var(--space-4); }
+
+@media (max-width: 860px) {
+  .live-main { grid-template-columns: 1fr; }
+}
+
+.section-title {
+  font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--color-accent); margin: 0 0 var(--space-2);
+}
+
+.panel { padding: var(--space-3); border: 1px solid var(--color-divider); }
 
 .banner {
-  padding: 0.6rem 1.5rem;
+  padding: var(--space-2) var(--space-4);
   font-size: 0.85rem;
 }
 
-.banner-error { background: #fee2e2; color: #991b1b; }
-.banner-warn { background: #fef3c7; color: #92400e; }
+.banner-error { background: var(--color-error-bg); color: var(--color-error-text); }
+.banner-warn { background: var(--color-warn-bg); color: var(--color-warn-text); }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 1rem;
-  margin-bottom: 1rem;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
   flex-wrap: wrap;
 }
 
 .inline-form { margin: 0; }
 
 .btn {
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--card-bg);
-  color: var(--text);
-  cursor: pointer;
+  padding: var(--space-2) calc(var(--space-3) * 1.2);
+  border-radius: 0;
+  border: 1px solid var(--color-divider);
+  background: transparent;
+  color: var(--color-text);
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
   font-size: 0.9rem;
+  cursor: pointer;
 }
 
-.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary { background: var(--color-accent); color: var(--color-bg); border-color: var(--color-accent); }
+.btn-primary:hover { background: var(--color-accent-600); }
 
-.last-refreshed, .hint { color: var(--muted); font-size: 0.85rem; }
+.btn-danger { color: var(--color-error-text); border-color: var(--color-error-text); }
+.btn-danger:hover { background: var(--color-error-bg); }
 
-.autopoll { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: var(--muted); }
-.poll-status { font-size: 0.85rem; color: #92400e; }
+.last-refreshed, .hint { color: var(--color-neutral-600); font-size: 0.85rem; }
 
-.map { height: 320px; width: 100%; border-radius: 8px; border: 1px solid var(--border); }
+.autopoll { display: flex; align-items: center; gap: var(--space-1); font-size: 0.85rem; color: var(--color-neutral-600); }
+.poll-status { font-size: 0.85rem; color: var(--color-warn-text); }
+
+.driver-field {
+  display: flex; align-items: center; gap: var(--space-1);
+  font-size: 0.85rem; color: var(--color-neutral-600);
+}
+.driver-field input {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-divider);
+  border-radius: 0;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 0.85rem;
+  width: 10rem;
+}
+
+.map { height: 260px; width: 100%; border-radius: 0; border: 1px solid var(--color-divider); }
 .location-meta {
   display: flex; justify-content: space-between; align-items: center;
-  font-size: 0.85rem; color: var(--muted); margin: 0.5rem 0 1.5rem;
+  font-size: 0.85rem; color: var(--color-neutral-600); margin: var(--space-2) 0 0;
+  flex-wrap: wrap; gap: var(--space-2);
 }
-.location-meta a { color: var(--accent); }
+.location-meta a { color: var(--color-accent); }
 
 .card-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1rem;
-  margin-bottom: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 .card {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1rem;
+  position: relative;
+  border: 1px solid var(--color-divider);
+  border-radius: 0;
 }
 
-.card.status-ok { border-left: 4px solid #22c55e; }
-.card.status-bad { border-left: 4px solid #ef4444; }
-.card.status-unknown { border-left: 4px solid var(--muted); }
+.card.status-ok { border-left: 4px solid var(--color-ok); }
+.card.status-bad { border-left: 4px solid var(--color-bad); }
+.card.status-unknown { border-left: 4px solid var(--color-unknown); }
 
-.card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; }
-.card-emoji { font-size: 1.2rem; }
-.card-name { font-weight: 600; }
-.card-detail { color: var(--muted); font-size: 0.8rem; word-break: break-word; }
+.card-header {
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; padding: var(--space-3);
+  background: none; border: none; margin: 0;
+  font: inherit; text-align: left; color: inherit; cursor: pointer;
+}
+.card-emoji { font-size: 1.1rem; line-height: 1; }
+.card-name { font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 1.05rem; flex: 1; }
 
-.screenshot-panel { margin-bottom: 1.5rem; }
+/* Independent of the card's main status color (e.g. Camera stays green on
+   TCP reachability alone) — this is the visible signal for a secondary,
+   advisory reading like clarity that must never flip the card itself. */
+.card-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.card-badge.status-ok { color: var(--color-ok); border-color: var(--color-ok); }
+.card-badge.status-bad { color: var(--color-bad); border-color: var(--color-bad); }
+.card-badge.status-warn { color: var(--color-warn-text); border-color: var(--color-warn-text); }
+
+.card-chevron {
+  display: inline-flex; flex-shrink: 0;
+  transition: transform 0.15s;
+  color: var(--color-neutral-500);
+}
+.card.is-expanded .card-chevron { transform: rotate(180deg); }
+
+.card-body { display: none; padding: 0 var(--space-3) var(--space-3); }
+.card.is-expanded .card-body { display: block; border-top: 1px solid var(--color-neutral-200); padding-top: var(--space-2); }
+
+.card-rows { display: grid; grid-template-columns: max-content 1fr; }
+.card-row-label {
+  padding: 5px var(--space-2) 5px 0; border-bottom: 1px solid var(--color-neutral-200);
+  font-size: 0.8rem; color: var(--color-neutral-600);
+}
+.card-row-value {
+  padding: 5px 0; border-bottom: 1px solid var(--color-neutral-200);
+  text-align: right; font-size: 0.85rem; color: var(--color-text);
+}
+.card-rows > div:nth-last-child(-n+2) { border-bottom: none; }
+.card-row-value.alert { color: var(--color-bad); font-weight: 700; }
+
+.card-raw {
+  margin-top: var(--space-2);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.7rem; color: var(--color-neutral-500); word-break: break-word;
+}
+
+.card-sentence { margin: 0; font-size: 0.85rem; color: var(--color-neutral-700); line-height: 1.5; }
+.card-sentence.alert { color: var(--color-bad); }
+
 #screenshot-img {
   display: block;
   max-width: 100%;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  margin-top: 0.5rem;
+  border-radius: 0;
+  border: 1px solid var(--color-divider);
+  margin-top: var(--space-2);
 }
 
-.legend { color: var(--muted); font-size: 0.8rem; }
+.legend { color: var(--color-neutral-600); font-size: 0.75rem; }
 
 .report-textarea {
   width: 100%;
   font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
   font-size: 0.85rem;
-  padding: 0.75rem;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--card-bg);
-  color: var(--text);
+  padding: var(--space-3);
+  border-radius: 0;
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  color: var(--color-text);
   white-space: pre;
 }
 
-/* Trends — sparklines from logs/history.jsonl. Sized to sit in the same grid rhythm as
-   the status cards above them, so the page reads as one column of panels. */
-.section-title { font-size: 1rem; margin: 1.5rem 0 0.5rem; color: var(--muted); }
-
+/* Trends — sparklines from logs/history.jsonl, sitting inside the Trends panel. */
 .trend-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0.75rem;
-  margin-bottom: 1.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
 }
 
-.trend {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 0.75rem;
-}
+.trend-header { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.75rem; color: var(--color-neutral-600); }
+.trend-latest { font-weight: 600; color: var(--color-text); }
 
-.trend-header { display: flex; justify-content: space-between; align-items: baseline; }
-.trend-label { font-size: 0.8rem; color: var(--muted); }
-.trend-latest { font-weight: 600; }
+/* The polyline strokes currentColor, so it follows the accent through the
+   dark-mode token swap rather than pinning a color that only reads on one background. */
+.trend-spark { display: block; margin: var(--space-1) 0; color: var(--color-accent-600); overflow: visible; }
 
-/* The polyline strokes currentColor, so it follows --accent through the dark-mode swap
-   rather than pinning a blue that only reads on one background. */
-.trend-spark { display: block; margin: 0.4rem 0; color: var(--accent); overflow: visible; }
-
-.trend-range { font-size: 0.7rem; color: var(--muted); }
+.trend-range { font-size: 0.65rem; color: var(--color-neutral-500); }

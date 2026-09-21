@@ -13,11 +13,25 @@
     and must not be trusted. Check <code>systemctl status health-agent</code> on the truck.
   </div>
 {% endif %}
+{% if state.rebooting %}
+  <div class="banner banner-warn">
+    🔄 Device is rebooting -- may take a couple of minutes to reconnect.
+  </div>
+{% endif %}
 {% if state.connection_error %}
   <div class="banner banner-error">Connection failed: {{ state.connection_error }}</div>
 {% endif %}
 {% if state.health_error %}
   <div class="banner banner-warn">health.json: {{ state.health_error }}</div>
+{% endif %}
+{% if pipeline_alert %}
+  {# Same blind spot as the stale-snapshot banner above, one layer down: health-agent and
+     SSH are both fine here, so nothing else on the page shouts about it — only the
+     Pipeline card goes red, which is easy to miss on a scan. #}
+  <div class="banner banner-error">
+    🔴 Detection pipeline is not running — health-agent and SSH are fine, only detection.py
+    is down. Check <code>systemctl status hailo-detection</code> on the truck.
+  </div>
 {% endif %}
 {% if state.tailscale_error %}
   <div class="banner banner-warn">tailscale status: {{ state.tailscale_error }}</div>

@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% set active = "live" %}
 {% block head_extra %}
 {# Vendored (static/vendor/leaflet, Leaflet 1.9.4, SRI-verified against unpkg). Served
    locally because this tool is used in the field: off the CDN, `L` was undefined and the
@@ -8,8 +7,8 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}" />
 <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
 {% endblock %}
-{% block content %}
-  <section class="toolbar">
+{% block header_toolbar %}
+  <div class="header-toolbar">
     <form method="post" action="{{ url_for('refresh') }}" class="inline-form">
       <button type="submit" class="btn btn-primary">Refresh Now</button>
     </form>
@@ -25,49 +24,83 @@
         Never refreshed
       {% endif %}
     </span>
-  </section>
+    {# Persisted to disk (see driver.py), not in `state` — it must survive a laptop
+       restart and only ever changes when someone types a new one here. #}
+    <span class="driver-field">
+      Driver:
+      <input type="text" id="driver-name" value="{{ driver_name }}" placeholder="Not set">
+      <span id="driver-status"></span>
+    </span>
+  </div>
+{% endblock %}
+{% block content %}
+  <div class="live-main">
+    <section class="status-col">
+      <h2 class="section-title">Status</h2>
+      <div class="card-grid" id="card-grid">{% include "_cards.html" %}</div>
 
-  {# The map element is always present, hidden until there is somewhere to point it. It
-     used to be rendered only inside {% if marker %}, which meant the first fix after a
-     cold start had no element to draw into and needed a full page load to appear. #}
-  <section class="location-panel">
-    <div id="map" class="map {{ 'map-stale' if marker and marker.freshness == 'stale' else '' }}"
-         {% if not marker %}hidden{% endif %}></div>
-    <div class="location-meta" id="location-meta" {% if not marker %}hidden{% endif %}>
-      <span id="location-label">{% if marker %}{{ marker.label }}{% if town %} — {{ town }}{% endif %}{% endif %}</span>
-      <a id="location-link" href="{{ marker.maps_url if marker else '#' }}" target="_blank" rel="noopener">Open in Google Maps ↗</a>
-    </div>
-    <p class="hint" id="no-location" {% if marker %}hidden{% endif %}>No GPS location recorded yet.</p>
-  </section>
+      <h2 class="section-title">Daily Report</h2>
+      <div id="report">{% include "_report.html" %}</div>
+    </section>
 
-  <section class="card-grid" id="card-grid">{% include "_cards.html" %}</section>
+    <section class="side-col">
+      {# The map element is always present, hidden until there is somewhere to point it. It
+         used to be rendered only inside {% if marker %}, which meant the first fix after a
+         cold start had no element to draw into and needed a full page load to appear. #}
+      <div class="panel blueprint">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h2 class="section-title">Location</h2>
+        <div id="map" class="map {{ 'map-stale' if marker and marker.freshness == 'stale' else '' }}"
+             {% if not marker %}hidden{% endif %}></div>
+        <div class="location-meta" id="location-meta" {% if not marker %}hidden{% endif %}>
+          <span id="location-label">{% if marker %}{{ marker.label }}{% if town %} — {{ town }}{% endif %}{% endif %}</span>
+          <a id="location-link" href="{{ marker.maps_url if marker else '#' }}" target="_blank" rel="noopener">Open in Google Maps ↗</a>
+        </div>
+        <p class="hint" id="no-location" {% if marker %}hidden{% endif %}>No GPS location recorded yet.</p>
+      </div>
 
-  <section class="trend-panel">
-    <h2 class="section-title">Trends</h2>
-    <div id="trends">{% include "_trends.html" %}</div>
-  </section>
+      <div class="panel blueprint">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h2 class="section-title">Trends</h2>
+        <div id="trends">{% include "_trends.html" %}</div>
+      </div>
 
-  <section class="screenshot-panel">
-    <div class="toolbar">
-      <button type="button" id="grab-screenshot" class="btn">Grab Screenshot</button>
-      <span id="screenshot-status">
-        {% if state.screenshot_error %}Failed: {{ state.screenshot_error }}{% endif %}
-      </span>
-      {# A failed grab keeps the previous capture rather than blanking the panel, and the
-         auto-refresh only recaptures every few minutes, so this timestamp is what stops a
-         retained image from passing as the current screen. #}
-      <span class="last-refreshed" id="screenshot-ts" {% if not state.screenshot %}hidden{% endif %}>
-        {% if state.screenshot %}Captured: {{ state.screenshot.ts.strftime('%Y-%m-%d %H:%M:%S') }}{% endif %}
-      </span>
-    </div>
-    {% if state.screenshot %}
-      <img id="screenshot-img"
-           src="{{ url_for('screenshot') }}?v={{ state.screenshot.version }}"
-           alt="Pi screenshot — captured periodically on refresh" />
-    {% else %}
-      <p class="hint" id="screenshot-placeholder">No screenshot captured yet.</p>
-    {% endif %}
-  </section>
+      <div class="panel blueprint">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div class="toolbar">
+          <h2 class="section-title" style="margin: 0;">Screenshot</h2>
+          <button type="button" id="grab-screenshot" class="btn">Grab Screenshot</button>
+          <span id="screenshot-status">
+            {% if state.screenshot_error %}Failed: {{ state.screenshot_error }}{% endif %}
+          </span>
+          {# A failed grab keeps the previous capture rather than blanking the panel, and the
+             auto-refresh only recaptures every few minutes, so this timestamp is what stops a
+             retained image from passing as the current screen. #}
+          <span class="last-refreshed" id="screenshot-ts" {% if not state.screenshot %}hidden{% endif %}>
+            {% if state.screenshot %}Captured: {{ state.screenshot.ts.strftime('%Y-%m-%d %H:%M:%S') }}{% endif %}
+          </span>
+        </div>
+        {% if state.screenshot %}
+          <img id="screenshot-img"
+               src="{{ url_for('screenshot') }}?v={{ state.screenshot.version }}"
+               alt="Pi screenshot — captured periodically on refresh" />
+        {% else %}
+          <p class="hint" id="screenshot-placeholder">No screenshot captured yet.</p>
+        {% endif %}
+      </div>
+
+      <div class="panel blueprint">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div class="toolbar">
+          <h2 class="section-title" style="margin: 0;">Danger Zone</h2>
+          <button type="button" id="reboot-device" class="btn btn-danger">Reboot Device</button>
+          <span id="reboot-status"></span>
+        </div>
+        <p class="hint">Power-cycles the Pi over SSH. Interrupts any active recording; the
+          device takes a couple of minutes to come back.</p>
+      </div>
+    </section>
+  </div>
 
   <p class="legend">▶️ = running &nbsp; ⏸️ = pause &nbsp; ✅ = ok &nbsp; 🔴 = not ok &nbsp; ⚪ = not determined</p>
 
@@ -75,6 +108,50 @@
     const toggle = document.getElementById("autopoll-toggle");
     const pollStatus = document.getElementById("poll-status");
     let pollTimer = null;
+
+    // Card expand/collapse state lives here, not in the DOM: the 30s poll replaces
+    // #card-grid's innerHTML wholesale, which would otherwise wipe any per-card state
+    // (e.g. an <details open> attribute) on every tick. Resets on a real page reload —
+    // that's deliberate, not a bug: a card the operator collapsed yesterday should not
+    // stay collapsed if it's unhealthy today.
+    const cardOverrides = {};
+
+    function syncCardStates() {
+      document.querySelectorAll("#card-grid .card[data-card]").forEach((card) => {
+        const name = card.dataset.card;
+        const defaultExpanded = card.dataset.defaultExpanded === "true";
+        const expanded = name in cardOverrides ? cardOverrides[name] : defaultExpanded;
+        card.classList.toggle("is-expanded", expanded);
+        card.querySelector(".card-header").setAttribute("aria-expanded", String(expanded));
+      });
+    }
+
+    // Bound once to the container rather than per-card: delegation means this listener
+    // survives the innerHTML swap above without needing to be rebound after every poll.
+    document.getElementById("card-grid").addEventListener("click", (e) => {
+      const header = e.target.closest(".card-header");
+      if (!header) return;
+      const card = header.closest(".card[data-card]");
+      cardOverrides[card.dataset.card] = !card.classList.contains("is-expanded");
+      syncCardStates();
+    });
+
+    syncCardStates();
+
+    // Delegated for the same reason as the card-grid listener above: #report's innerHTML
+    // is replaced wholesale on every poll, which would silently drop a listener bound
+    // directly to #copy-report.
+    document.getElementById("report").addEventListener("click", async (e) => {
+      if (!e.target.closest("#copy-report")) return;
+      const text = document.getElementById("report-text").value;
+      const status = document.getElementById("copy-status");
+      try {
+        await navigator.clipboard.writeText(text);
+        status.textContent = "Copied.";
+      } catch (err) {
+        status.textContent = "Copy failed: " + err;
+      }
+    });
 
     // Built once and kept. The old poll finished by reloading the whole page, which tore
     // down and rebuilt the map every 30 seconds — throwing away the operator's pan and
@@ -159,7 +236,9 @@
     function applyStatus(payload) {
       document.getElementById("banners").innerHTML = payload.banners_html;
       document.getElementById("card-grid").innerHTML = payload.cards_html;
+      syncCardStates();
       document.getElementById("trends").innerHTML = payload.trends_html;
+      document.getElementById("report").innerHTML = payload.report_html;
       document.getElementById("last-refreshed").textContent =
         payload.last_refreshed ? "Last refreshed: " + payload.last_refreshed : "Never refreshed";
 
@@ -249,6 +328,41 @@
       if (!document.hidden) startPolling();
     }
 
+    // Saves on blur/Enter rather than per-keystroke: this is a name someone types once
+    // and leaves alone, not something that needs a request on every character.
+    const driverInput = document.getElementById("driver-name");
+    const driverStatus = document.getElementById("driver-status");
+    let savedDriverName = driverInput.value;
+
+    async function saveDriverName() {
+      const name = driverInput.value.trim();
+      if (name === savedDriverName) return;
+      driverStatus.textContent = "Saving...";
+      try {
+        const resp = await fetch("{{ url_for('set_driver') }}", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "name=" + encodeURIComponent(name),
+        });
+        if (!resp.ok) {
+          driverStatus.textContent = "Failed: " + (await resp.text());
+          return;
+        }
+        savedDriverName = name;
+        driverStatus.textContent = "Saved.";
+      } catch (err) {
+        driverStatus.textContent = "Failed: " + err;
+      }
+    }
+
+    driverInput.addEventListener("blur", saveDriverName);
+    driverInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        driverInput.blur();
+      }
+    });
+
     document.getElementById("grab-screenshot").addEventListener("click", async () => {
       const shotStatus = document.getElementById("screenshot-status");
       shotStatus.textContent = "Grabbing...";
@@ -266,6 +380,29 @@
         shotStatus.textContent = "";
       } catch (err) {
         shotStatus.textContent = "Failed: " + err;
+      }
+    });
+
+    document.getElementById("reboot-device").addEventListener("click", async () => {
+      if (!confirm("Reboot the Pi? Active recording will be interrupted.")) return;
+
+      const rebootStatus = document.getElementById("reboot-status");
+      const rebootBtn = document.getElementById("reboot-device");
+      rebootBtn.disabled = true;
+      rebootStatus.textContent = "Sending reboot...";
+      try {
+        const resp = await fetch("{{ url_for('reboot') }}", { method: "POST" });
+        if (!resp.ok) {
+          rebootStatus.textContent = "Failed: " + (await resp.text());
+          return;
+        }
+        // The banner (rendered from state.rebooting on the next poll/reload) is the
+        // durable status; this is just the immediate click feedback.
+        rebootStatus.textContent = "Reboot sent.";
+      } catch (err) {
+        rebootStatus.textContent = "Failed: " + err;
+      } finally {
+        rebootBtn.disabled = false;
       }
     });
 

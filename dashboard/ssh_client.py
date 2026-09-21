@@ -142,6 +142,34 @@ def is_alive(client):
     return transport is not None and transport.is_active()
 
 
+def reboot_device(client, password):
+    """Reboot the Pi via `sudo -S reboot`, piping the same password already used to SSH in.
+
+    The Pi tears this SSH session down almost the instant `reboot` actually runs — often
+    before the exit status, or even the rest of stderr, can be read back. That is the
+    expected, successful case, not a failure: it is swallowed here rather than raised.
+    Only a rejection that arrives *before* the connection dies (a wrong sudo password) is
+    a real error worth surfacing.
+    """
+    try:
+        stdin, stdout, stderr = client.exec_command("sudo -S reboot", timeout=EXEC_TIMEOUT)
+    except (paramiko.SSHException, OSError, EOFError) as exc:
+        # The command was never even sent — distinct from the connection dropping after
+        # it was, and the caller (app.py) treats this the same as any other SSH failure.
+        raise SSHCommandError(f"SSH connection lost: {exc}") from exc
+
+    try:
+        stdin.write(password + "\n")
+        stdin.flush()
+        err = stderr.read()
+        exit_status = stdout.channel.recv_exit_status()
+    except (paramiko.SSHException, OSError, EOFError):
+        return
+
+    if exit_status != 0:
+        raise SSHCommandError(f"reboot failed: {err.decode(errors='replace').strip()}")
+
+
 def grab_screenshot(client):
     # raspi2png depends on the dispmanx API, which the Pi 5 dropped — grim is the
     # Wayland-native replacement. `grim -` writes the PNG straight to stdout, so no

@@ -5,6 +5,7 @@ from status import (
     build_location_marker,
     build_status_cards,
     is_stale,
+    pipeline_down_while_connected,
 )
 
 HEALTHY_HEALTH = {
@@ -17,9 +18,8 @@ HEALTHY_HEALTH = {
     "pipeline": {
         "ok": True, "instances": 1, "duplicate_instances": False,
         "heartbeat_age_sec": 2.1, "fps": 8.4, "confirmed_min_confidence": 0.75,
-        "error": None,
     },
-    "upload": {"ok": True, "queue_depth": 0, "dropped_total": 0, "error": None},
+    "upload": {"ok": True, "queue_depth": 0, "dropped_total": 0},
     "camera": {
         "ok": True, "tcp_ok": True, "tcp_connect_ms": 0.8,
         "clarity": {"checked": True, "clear": True, "blur_score": 17.7,
@@ -27,10 +27,22 @@ HEALTHY_HEALTH = {
         "drift_scan": None,
     },
     "gps": {
-        "ok": True, "reason": None, "lat": 3.404744, "lon": 101.371961,
+        "ok": True, "device_present": True, "port": "/dev/gps", "nmea_status": "status=A",
+        "lat": 3.404744, "lon": 101.371961,
         "last_valid_age_sec": 3.2, "last_sentence_age_sec": 1.0, "speed_kmh": 15.0,
+        "reopen_total": 1, "writer_age_sec": 4.9,
     },
-    "tailscale": {"ok": True, "key_expiry_days": None},
+    "tailscale": {
+        "ok": True, "checked": True, "online": True, "backend_state": "Running",
+        "hostname": "raspberrypi", "key_expiry_days": None,
+        "tailscale_ips": ["100.110.189.87"], "version": "1.102.2-t6cac91817-g6ff0ddc72",
+        "health": [],
+    },
+    "self_heal": {"enabled": True, "self_heals": 0, "tailscale_bad_cycles": 0, "actions": []},
+    "service": {
+        "hailo-detection.service": {"ok": True, "active_state": "active", "restarts": 1},
+        "health-agent.service": {"ok": True, "active_state": "active", "restarts": 0},
+    },
 }
 HEALTHY_TAILSCALE = {"BackendState": "Running"}
 
@@ -84,6 +96,187 @@ def test_camera_ok_is_tcp_reachability_only_clarity_never_colours_it():
     assert "clear=False" in card["detail"]
 
 
+def test_camera_clarity_badge_red_when_not_clear_even_though_card_stays_green():
+    health = {**HEALTHY_HEALTH, "camera": {
+        "ok": True, "tcp_ok": True, "tcp_connect_ms": 1.2,
+        "clarity": {"checked": True, "clear": False, "blur_score": 9.1,
+                     "blur_spread": [5.0, 12.0], "age_sec": 90.0},
+        "drift_scan": None,
+    }}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    card = _card(cards, "Camera")
+    assert card["emoji"] == "✅"
+    assert card["badge"]["emoji"] == "🔴"
+    assert card["badge"]["css_class"] == "status-bad"
+    assert "not clear" in card["badge"]["text"]
+
+
+def test_camera_clarity_badge_green_when_clear():
+    cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE)
+    card = _card(cards, "Camera")
+    assert card["badge"]["emoji"] == "✅"
+    assert card["badge"]["css_class"] == "status-ok"
+    assert "clear" in card["badge"]["text"]
+
+
+def test_camera_clarity_badge_absent_when_not_checked():
+    health = {**HEALTHY_HEALTH, "camera": {
+        "ok": True, "tcp_ok": True, "tcp_connect_ms": 0.8,
+        "clarity": {"checked": False}, "drift_scan": None,
+    }}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    assert _card(cards, "Camera")["badge"] is None
+
+
+def test_camera_clarity_badge_absent_when_clarity_block_missing():
+    health = {**HEALTHY_HEALTH, "camera": {"ok": True, "tcp_ok": True, "tcp_connect_ms": 0.8}}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    assert _card(cards, "Camera")["badge"] is None
+
+
+def test_clarity_badge_distinguishes_blank():
+    health = {**HEALTHY_HEALTH, "camera": {**HEALTHY_HEALTH["camera"], "clarity": {
+        "checked": True, "clear": False, "blank": True, "obstructed": False, "blurry": False,
+        "blur_score": 1.0,
+    }}}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["badge"]
+    assert "BLANK" in badge["text"]
+
+
+def test_clarity_badge_distinguishes_obstructed():
+    health = {**HEALTHY_HEALTH, "camera": {**HEALTHY_HEALTH["camera"], "clarity": {
+        "checked": True, "clear": False, "blank": False, "obstructed": True, "blurry": False,
+        "blur_score": 1.0,
+    }}}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["badge"]
+    assert "OBSTRUCTED" in badge["text"]
+
+
+def test_clarity_badge_distinguishes_blurry():
+    health = {**HEALTHY_HEALTH, "camera": {**HEALTHY_HEALTH["camera"], "clarity": {
+        "checked": True, "clear": False, "blank": False, "obstructed": False, "blurry": True,
+        "blur_score": 1.0,
+    }}}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["badge"]
+    assert "BLURRY" in badge["text"]
+
+
+def test_clarity_badge_priority_blank_beats_obstructed_and_blurry_when_all_true():
+    health = {**HEALTHY_HEALTH, "camera": {**HEALTHY_HEALTH["camera"], "clarity": {
+        "checked": True, "clear": False, "blank": True, "obstructed": True, "blurry": True,
+        "blur_score": 1.0,
+    }}}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["badge"]
+    assert "BLANK" in badge["text"]
+
+
+def test_cards_without_a_badge_source_have_no_badge():
+    cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE)
+    for name in ("Pipeline", "GPS", "Upload"):
+        assert _card(cards, name)["badge"] is None
+
+
+def test_system_card_shows_zero_action_self_heal_badge_when_healthy():
+    cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE)
+    badge = _card(cards, "System")["badge"]
+    assert badge["css_class"] == "status-ok"
+    assert "0 actions" in badge["text"]
+
+
+def test_tailscale_card_has_no_badge_when_health_json_warnings_empty():
+    cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE)
+    assert _card(cards, "Tailscale")["badge"] is None
+
+
+# --- system: load/mem/uptime/services -------------------------------------------------
+
+
+def test_system_card_includes_load_avg_mem_and_uptime_when_present():
+    health = {**HEALTHY_HEALTH, "system": {
+        **HEALTHY_HEALTH["system"],
+        "load_avg": [1.5, 2.5, 3.5], "mem_total_kb": 1000, "mem_available_kb": 250,
+        "uptime_sec": 4000,
+    }}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["detail"]
+    assert "load_avg=1.50/2.50/3.50" in detail
+    assert "mem=75% used" in detail
+    assert "uptime=1h6m" in detail
+
+
+def test_system_card_omits_load_mem_uptime_segments_when_absent():
+    detail = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "System")["detail"]
+    assert "load_avg=" not in detail
+    assert "mem=" not in detail
+    assert "uptime=" not in detail
+
+
+def test_system_card_service_summary_lists_restarts_per_unit():
+    detail = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "System")["detail"]
+    assert "hailo-detection=active(restarts=1)" in detail
+    assert "health-agent=active(restarts=0)" in detail
+    assert "SERVICE ALERT" not in detail
+
+
+def test_system_card_service_alert_appended_when_a_service_is_not_ok():
+    health = {**HEALTHY_HEALTH, "service": {
+        **HEALTHY_HEALTH["service"],
+        "hailo-detection.service": {"ok": False, "active_state": "failed", "restarts": 4},
+    }}
+    card = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")
+    assert "SERVICE ALERT" in card["detail"]
+    assert card["emoji"] == "✅"  # never recolors System — system.ok is still true
+
+
+def test_system_card_no_service_segment_when_service_section_absent():
+    health = {k: v for k, v in HEALTHY_HEALTH.items() if k != "service"}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["detail"]
+    assert "services:" not in detail
+
+
+# --- self-heal badge -------------------------------------------------------------------
+
+
+def test_self_heal_badge_warn_when_actions_have_fired_shows_last_action():
+    health = {**HEALTHY_HEALTH, "self_heal": {
+        "enabled": True, "self_heals": 2, "tailscale_bad_cycles": 0,
+        "actions": [{"type": "restarted camera"}, {"type": "restarted tailscale"}],
+    }}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["badge"]
+    assert badge["css_class"] == "status-warn"
+    assert "2 action(s)" in badge["text"]
+    assert "restarted tailscale" in badge["text"]
+
+
+def test_self_heal_badge_bad_when_disabled():
+    health = {**HEALTHY_HEALTH, "self_heal": {"enabled": False, "self_heals": 0,
+                                                "tailscale_bad_cycles": 0, "actions": []}}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["badge"]
+    assert badge["css_class"] == "status-bad"
+    assert "disabled" in badge["text"]
+
+
+def test_self_heal_badge_absent_when_section_missing():
+    health = {k: v for k, v in HEALTHY_HEALTH.items() if k != "self_heal"}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["badge"]
+    assert badge is None
+
+
+def test_self_heal_action_with_unexpected_shape_does_not_raise():
+    health = {**HEALTHY_HEALTH, "self_heal": {
+        "enabled": True, "self_heals": 1, "tailscale_bad_cycles": 0,
+        "actions": ["restarted tailscale"],
+    }}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["badge"]
+    assert "restarted tailscale" in badge["text"]
+
+    health2 = {**HEALTHY_HEALTH, "self_heal": {
+        "enabled": True, "self_heals": 1, "tailscale_bad_cycles": 0,
+        "actions": [{"foo": "bar"}],
+    }}
+    badge2 = _card(build_status_cards(health2, HEALTHY_TAILSCALE), "System")["badge"]
+    assert badge2 is not None  # must not raise
+
+
 def test_camera_unreachable_shows_drift_scan():
     health = {**HEALTHY_HEALTH, "camera": {
         "ok": False, "tcp_ok": False, "tcp_connect_ms": None,
@@ -131,12 +324,98 @@ def test_gps_card_shows_no_fix_yet_when_reader_active_but_no_coordinates():
     assert "location=no fix yet" in _card(cards, "GPS")["detail"]
 
 
+def test_gps_ok_null_still_prefers_legacy_reason_field_when_present():
+    health = {**HEALTHY_HEALTH, "gps": {"ok": None, "reason": "legacy reason string",
+                                          "device_present": True, "nmea_status": "status=V"}}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "GPS")["detail"]
+    assert detail.startswith("legacy reason string")
+
+
+def test_gps_ok_null_uses_device_present_and_nmea_status_when_reason_absent():
+    health = {**HEALTHY_HEALTH, "gps": {"ok": None, "device_present": True, "nmea_status": "status=V"}}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "GPS")["detail"]
+    assert "device present" in detail
+    assert "status=V" in detail
+
+
+def test_gps_ok_null_falls_back_to_generic_when_device_present_and_nmea_both_absent():
+    health = {**HEALTHY_HEALTH, "gps": {"ok": None}}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "GPS")["detail"]
+    assert "not determined" in detail
+
+
+def test_gps_detail_includes_reopen_total_and_writer_age_when_present():
+    detail = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "GPS")["detail"]
+    assert "reopens=1" in detail
+    assert "writer_age=4.9s" in detail
+
+
+def test_gps_detail_omits_reopen_total_and_writer_age_when_absent():
+    health = {**HEALTHY_HEALTH, "gps": {
+        "ok": True, "lat": 3.4, "lon": 101.3,
+        "last_valid_age_sec": 1.0, "last_sentence_age_sec": 1.0, "speed_kmh": 1.0,
+    }}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "GPS")["detail"]
+    assert "reopens=" not in detail
+    assert "writer_age=" not in detail
+
+
 def test_upload_not_ok_flags_upload_card():
     health = {**HEALTHY_HEALTH, "upload": {"ok": False, "error": "no pipeline heartbeat to read upload stats from"}}
     cards = build_status_cards(health, HEALTHY_TAILSCALE)
     card = _card(cards, "Upload")
     assert card["emoji"] == "🔴"
     assert "no pipeline heartbeat" in card["detail"]
+
+
+def test_upload_card_shows_training_queue_when_present():
+    health = {**HEALTHY_HEALTH, "upload": {
+        "ok": True, "queue_depth": 0, "dropped_total": 0,
+        "training_enabled": 1, "training_queue_depth": 3, "training_dropped_total": 2,
+    }}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Upload")["detail"]
+    assert "training: queue_depth=3, dropped_total=2" in detail
+
+
+def test_upload_card_omits_training_segment_when_absent():
+    detail = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "Upload")["detail"]
+    assert "training:" not in detail
+
+
+def test_upload_card_flags_training_disabled():
+    health = {**HEALTHY_HEALTH, "upload": {
+        "ok": True, "queue_depth": 0, "dropped_total": 0,
+        "training_enabled": 0, "training_queue_depth": 0, "training_dropped_total": 0,
+    }}
+    detail = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Upload")["detail"]
+    assert "(disabled)" in detail
+
+
+def test_tailscale_card_shows_warnings_badge_when_health_json_has_warnings():
+    health = {**HEALTHY_HEALTH, "tailscale": {
+        **HEALTHY_HEALTH["tailscale"], "health": ["route warning"],
+    }}
+    badge = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Tailscale")["badge"]
+    assert badge["css_class"] == "status-warn"
+    assert "route warning" in badge["text"]
+
+
+def test_tailscale_ok_still_driven_by_live_backend_state_not_health_json_warnings():
+    health = {**HEALTHY_HEALTH, "tailscale": {
+        **HEALTHY_HEALTH["tailscale"], "health": ["some advisory"],
+    }}
+    card = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Tailscale")
+    assert card["emoji"] == "✅"  # HEALTHY_TAILSCALE (live fetch) says Running regardless
+
+
+def test_stale_snapshot_still_shows_tailscale_warnings_badge_from_last_known_health():
+    health = {**HEALTHY_HEALTH, "tailscale": {
+        **HEALTHY_HEALTH["tailscale"], "health": ["route warning"],
+    }}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE, age_sec=600.0)
+    badge = _card(cards, "Tailscale")["badge"]
+    assert badge is not None
+    assert "route warning" in badge["text"]
 
 
 def test_tailscale_key_expiry_none_reads_as_disabled_not_unknown():
@@ -237,7 +516,7 @@ def test_non_numeric_lat_lon_does_not_raise():
         "gps": {"ok": True, "lat": "3.404744", "lon": "101.371961"},
     }
 
-    gps_card = build_status_cards(health, None)[3]
+    gps_card = _card(build_status_cards(health, None), "GPS")
 
     assert gps_card["name"] == "GPS"
     assert "3.40474" in gps_card["detail"]
@@ -249,7 +528,7 @@ def test_unparseable_lat_lon_falls_back_to_no_fix():
         "gps": {"ok": True, "lat": "no-fix", "lon": None},
     }
 
-    gps_card = build_status_cards(health, None)[3]
+    gps_card = _card(build_status_cards(health, None), "GPS")
 
     assert "no fix yet" in gps_card["detail"]
 
@@ -321,3 +600,143 @@ def test_last_known_marker_with_an_unknown_fix_time_says_so():
 
     assert "None" not in marker["label"]
     assert marker["freshness"] == "stale"
+
+
+# --- structured rows --------------------------------------------------------------------
+
+
+def test_system_rows_include_temperature_disk_and_service_rows():
+    rows = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "System")["rows"]
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["Temperature"]["value"] == "44.6°C"
+    assert "63.3%" in by_label["Disk used"]["value"]
+    assert by_label["Disk used"]["alert"] is False
+    assert by_label["hailo-detection"]["value"] == "active (1 restarts)"
+
+
+def test_system_disk_alert_row_carries_alert_flag():
+    health = {**HEALTHY_HEALTH, "system": {**HEALTHY_HEALTH["system"], "disk_alert": True}}
+    rows = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["rows"]
+    assert next(r for r in rows if r["label"] == "Disk used")["alert"] is True
+
+
+def test_system_failed_service_row_carries_alert_flag():
+    health = {**HEALTHY_HEALTH, "service": {
+        **HEALTHY_HEALTH["service"],
+        "hailo-detection.service": {"ok": False, "active_state": "failed", "restarts": 4},
+    }}
+    rows = _card(build_status_cards(health, HEALTHY_TAILSCALE), "System")["rows"]
+    assert next(r for r in rows if r["label"] == "hailo-detection")["alert"] is True
+
+
+def test_pipeline_rows_present_only_when_ok():
+    ok_rows = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "Pipeline")["rows"]
+    assert {r["label"] for r in ok_rows} == {"FPS", "Heartbeat age"}
+
+    health = {**HEALTHY_HEALTH, "pipeline": {"ok": False, "error": "heartbeat file missing"}}
+    bad_rows = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Pipeline")["rows"]
+    assert bad_rows == []
+
+
+def test_camera_clarity_not_clear_row_carries_alert_flag():
+    health = {**HEALTHY_HEALTH, "camera": {
+        "ok": True, "tcp_ok": True, "tcp_connect_ms": 1.2,
+        "clarity": {"checked": True, "clear": False, "blur_score": 9.1,
+                     "blur_spread": [5.0, 12.0], "age_sec": 90.0},
+        "drift_scan": None,
+    }}
+    rows = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["rows"]
+    assert next(r for r in rows if r["label"] == "Clarity")["alert"] is True
+
+
+def test_camera_clarity_row_says_not_checked_yet_when_unchecked():
+    health = {**HEALTHY_HEALTH, "camera": {
+        "ok": True, "tcp_ok": True, "tcp_connect_ms": 0.8,
+        "clarity": {"checked": False}, "drift_scan": None,
+    }}
+    rows = _card(build_status_cards(health, HEALTHY_TAILSCALE), "Camera")["rows"]
+    assert next(r for r in rows if r["label"] == "Clarity")["value"] == "not checked yet"
+
+
+def test_gps_rows_empty_when_ok_is_none():
+    health = {**HEALTHY_HEALTH, "gps": {"ok": None, "reason": "no GPS reader running"}}
+    assert _card(build_status_cards(health, HEALTHY_TAILSCALE), "GPS")["rows"] == []
+
+
+def test_gps_rows_present_when_ok_is_not_none():
+    rows = _card(build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE), "GPS")["rows"]
+    labels = {r["label"] for r in rows}
+    assert {"Location", "Fix age", "Sentence age", "Speed", "Reopens", "Writer age"} == labels
+
+
+def test_upload_rows_empty_when_no_data():
+    health = {**HEALTHY_HEALTH, "upload": {"ok": False, "error": "no pipeline heartbeat"}}
+    assert _card(build_status_cards(health, HEALTHY_TAILSCALE), "Upload")["rows"] == []
+
+
+def test_tailscale_rows_present_even_when_not_ok():
+    cards = build_status_cards(HEALTHY_HEALTH, {"BackendState": "NeedsLogin"})
+    rows = _card(cards, "Tailscale")["rows"]
+    assert {r["label"] for r in rows} == {"Backend state", "Key expiry"}
+
+
+def test_stale_and_no_data_cards_have_no_rows():
+    stale_cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE, age_sec=600.0)
+    for name in ("System", "Pipeline", "Camera", "GPS", "Upload"):
+        assert _card(stale_cards, name)["rows"] == []
+
+    no_data_cards = build_status_cards(None, None)
+    assert all(card["rows"] == [] for card in no_data_cards)
+
+
+# --- severity ordering -------------------------------------------------------------------
+
+
+def test_cards_sort_not_ok_first_then_unknown_then_ok():
+    health = {
+        **HEALTHY_HEALTH,
+        "camera": {"ok": False, "tcp_ok": False, "tcp_connect_ms": None, "clarity": {"checked": False}},
+        "gps": {"ok": None, "reason": "no GPS reader running"},
+    }
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    assert [c["name"] for c in cards] == ["Camera", "GPS", "System", "Pipeline", "Upload", "Tailscale"]
+
+
+def test_cards_with_equal_severity_keep_original_relative_order():
+    health = {
+        **HEALTHY_HEALTH,
+        "camera": {"ok": False, "tcp_ok": False, "tcp_connect_ms": None, "clarity": {"checked": False}},
+        "upload": {"ok": False, "error": "no pipeline heartbeat"},
+    }
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    not_ok_names = [c["name"] for c in cards if c["ok"] is False]
+    assert not_ok_names == ["Camera", "Upload"]
+
+
+# --- pipeline_down_while_connected --------------------------------------------------------
+
+
+def test_pipeline_down_while_connected_true_when_pipeline_explicitly_not_ok():
+    health = {**HEALTHY_HEALTH, "pipeline": {"ok": False, "error": "not running"}}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    assert pipeline_down_while_connected(cards, stale=False) is True
+
+
+def test_pipeline_down_while_connected_false_when_pipeline_healthy():
+    cards = build_status_cards(HEALTHY_HEALTH, HEALTHY_TAILSCALE)
+    assert pipeline_down_while_connected(cards, stale=False) is False
+
+
+def test_pipeline_down_while_connected_false_when_pipeline_ok_is_unknown():
+    # ok=None means "not determined yet" (missing section, older agent) — must stay
+    # neutral, same tri-state rule every other card already follows.
+    health = {**HEALTHY_HEALTH, "pipeline": {}}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE)
+    assert pipeline_down_while_connected(cards, stale=False) is False
+
+
+def test_pipeline_down_while_connected_false_when_stale():
+    # A stale snapshot already gets its own loud banner — this one must not pile on.
+    health = {**HEALTHY_HEALTH, "pipeline": {"ok": False, "error": "not running"}}
+    cards = build_status_cards(health, HEALTHY_TAILSCALE, age_sec=600.0)
+    assert pipeline_down_while_connected(cards, stale=True) is False

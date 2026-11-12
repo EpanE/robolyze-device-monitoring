@@ -418,3 +418,136 @@ def test_reboot_device_raises_on_a_rejected_sudo_password():
     client = FakeRebootClient(stdout=stdout, stderr=stderr)
     with pytest.raises(SSHCommandError, match="incorrect password"):
         reboot_device(client, "wrong")
+
+
+# --- fetch_logs ---------------------------------------------------------------------
+
+
+class FakeStdin:
+    def __init__(self):
+        self.written = []
+
+    def write(self, data):
+        self.written.append(data)
+
+    def flush(self):
+        pass
+
+
+class SequencedSSHClient:
+    """Answers each exec_command from a queue, so a first attempt and a sudo retry can differ."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.commands = []
+        self.stdins = []
+
+    def exec_command(self, command, timeout=None):
+        self.commands.append(command)
+        out, err, status = self._responses.pop(0)
+        stdin = FakeStdin()
+        self.stdins.append(stdin)
+        return stdin, FakeStream(out, status), FakeStream(err)
+
+
+@pytest.mark.parametrize("source, fragment", [
+    ("detection", "journalctl -u hailo-detection.service"),
+    ("health-agent", "journalctl -u health-agent.service"),
+    ("network", "journalctl -u tailscaled"),
+    ("boot-prev", "journalctl -b -1"),
+    ("edge", "edge_*.log"),
+])
+def test_fetch_logs_runs_the_fixed_command_for_each_source(source, fragment):
+    client = FakeSSHClient(stdout_data=b"hello\n")
+
+    text = ssh_client_module.fetch_logs(client, source, 50)
+
+    assert text == "hello\n"
+    assert fragment in client.last_command
+    assert "-n 50" in client.last_command
+
+
+def test_fetch_logs_rejects_an_unknown_source_without_touching_the_connection():
+    client = FakeSSHClient()
+
+    with pytest.raises(ValueError):
+        ssh_client_module.fetch_logs(client, "rm -rf /", 50)
+
+    assert client.last_command is None
+
+
+@pytest.mark.parametrize("asked, sent", [(5000, 1000), (0, 1), (-3, 1), ("25", 25)])
+def test_fetch_logs_clamps_the_line_count(asked, sent):
+    client = FakeSSHClient(stdout_data=b"x")
+
+    ssh_client_module.fetch_logs(client, "detection", asked)
+
+    assert f"-n {sent} " in client.last_command
+
+
+def test_fetch_logs_rejects_a_non_numeric_line_count():
+    with pytest.raises(ValueError):
+        ssh_client_module.fetch_logs(FakeSSHClient(), "detection", "lots")
+
+
+def test_fetch_logs_replaces_undecodable_bytes():
+    client = FakeSSHClient(stdout_data=b"ok \xff\xfe bad")
+
+    assert "ok" in ssh_client_module.fetch_logs(client, "detection", 10)
+
+
+def test_fetch_logs_keeps_the_tail_when_output_is_too_big():
+    big = b"A" * (ssh_client_module.MAX_LOG_BYTES + 5000) + b"THE-END"
+    client = FakeSSHClient(stdout_data=big)
+
+    text = ssh_client_module.fetch_logs(client, "detection", 1000)
+
+    assert text.endswith("THE-END")
+    assert "truncated" in text.splitlines()[0]
+    assert len(text) < len(big)
+
+
+def test_fetch_logs_raises_with_stderr_on_failure():
+    client = FakeSSHClient(stderr_data=b"no edge_*.log found", exit_status=1)
+
+    with pytest.raises(SSHCommandError, match="no edge_"):
+        ssh_client_module.fetch_logs(client, "edge", 10)
+
+
+def test_fetch_logs_turns_a_timeout_into_ssh_command_error():
+    client = FakeSSHClient(raises=socket.timeout())
+
+    with pytest.raises(SSHCommandError, match="timed out"):
+        ssh_client_module.fetch_logs(client, "detection", 10)
+
+
+def test_fetch_logs_retries_with_sudo_when_the_journal_is_not_readable():
+    hint = b"Hint: You are currently not seeing messages from other users and the system.\n"
+    client = SequencedSSHClient((hint + b"-- No entries --\n", b"", 0), (b"real log line\n", b"", 0))
+
+    text = ssh_client_module.fetch_logs(client, "detection", 10, password="pw")
+
+    assert text == "real log line\n"
+    assert client.commands[1].startswith("sudo -S")
+    assert client.stdins[1].written == ["pw\n"]
+    # The password travels over stdin, never on the command line.
+    assert "pw" not in client.commands[1]
+
+
+def test_fetch_logs_does_not_retry_without_a_password():
+    hint = b"Hint: You are currently not seeing messages from other users and the system.\n"
+    client = SequencedSSHClient((hint, b"", 0))
+
+    text = ssh_client_module.fetch_logs(client, "detection", 10)
+
+    assert "not seeing messages" in text
+    assert len(client.commands) == 1
+
+
+def test_fetch_logs_does_not_sudo_the_edge_log():
+    client = SequencedSSHClient((b"", b"permission denied", 1))
+
+    with pytest.raises(SSHCommandError):
+        ssh_client_module.fetch_logs(client, "edge", 10, password="pw")
+
+    assert len(client.commands) == 1

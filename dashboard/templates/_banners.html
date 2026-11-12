@@ -31,6 +31,15 @@
   <div class="banner banner-error">
     🔴 Detection pipeline is not running — health-agent and SSH are fine, only detection.py
     is down. Check <code>systemctl status hailo-detection</code> on the truck.
+    {% if pipeline_evidence %}
+      <br>hailo-detection:
+      {% if pipeline_evidence.active_state %}{{ pipeline_evidence.active_state }}{% if pipeline_evidence.sub_state %}/{{ pipeline_evidence.sub_state }}{% endif %},{% endif %}
+      {% if pipeline_evidence.result is defined %}result {{ pipeline_evidence.result }},{% endif %}
+      {% if pipeline_evidence.exit_code is defined %}exit code {{ pipeline_evidence.exit_code }},{% endif %}
+      {% if pipeline_evidence.restarts is defined %}restarts {{ pipeline_evidence.restarts }}.{% endif %}
+    {% endif %}
+    <a href="{{ url_for('logs_page', source='detection') }}">View logs</a> ·
+    <a href="{{ url_for('outage_history') }}">Outage history</a>
   </div>
 {% endif %}
 {% if state.tailscale_error %}

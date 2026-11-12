@@ -107,6 +107,11 @@
         </div>
         <p class="hint">Power-cycles the Pi over SSH. Interrupts any active recording; the
           device takes a couple of minutes to come back.</p>
+        <p class="hint" style="margin-bottom: 4px;">Manual reboot from Windows cmd (asks for the Pi SSH password):</p>
+        <pre><code>ssh {{ ssh_target }}
+sudo reboot</code></pre>
+        <p class="hint" style="margin-bottom: 4px;">Or in one line:</p>
+        <pre><code>ssh -t {{ ssh_target }} "sudo reboot"</code></pre>
       </div>
     </section>
   </div>

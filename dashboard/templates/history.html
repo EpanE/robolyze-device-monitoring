@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{# Event list rather than a chart: the question is "when, and for how long", which a row of
+   text answers exactly. Periods come from clarity_log.build_events. #}
+{# No live banners here: they describe the current snapshot, which this page does not load. #}
+{% block banners %}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>Camera clarity history</h2>
+  <p class="hint">
+    Recorded by this dashboard while it is running and the Pi is reachable; kept
+    {{ retention_days }} days. Time with no readings is shown as “No data”, never as clear.
+  </p>
+  <div class="filter-row">
+    <a class="filter-link{% if not problems_only %} active{% endif %}" href="{{ url_for('clarity_history') }}">All</a>
+    <a class="filter-link{% if problems_only %} active{% endif %}" href="{{ url_for('clarity_history', filter='problems') }}">Problems only</a>
+  </div>
+
+  {% if days %}
+    {% for day in days %}
+      <h3 class="event-day">{{ day.day }}</h3>
+      <ul class="event-list">
+        {% for e in day.events %}
+          <li class="event state-{{ e.state }}">
+            <span class="event-state">{{ 'No data' if e.state == 'gap' else e.state|capitalize }}</span>
+            <span class="event-time">
+              {{ e.start_text }} →
+              {% if e.ongoing %}now{% else %}{{ e.end_text }}{% endif %}
+            </span>
+            <span class="event-duration">{{ e.duration_text }}{% if e.ongoing %} so far{% endif %}</span>
+            {% if e.blur_score is not none %}<span class="event-score">blur score {{ e.blur_score }}</span>{% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endfor %}
+  {% else %}
+    <p class="hint">No clarity history yet{% if problems_only %} (or no problems in the last {{ retention_days }} days){% endif %}. It builds up as the dashboard refreshes.</p>
+  {% endif %}
+</section>
+{% endblock %}

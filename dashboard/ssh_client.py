@@ -68,13 +68,16 @@ def connect(host, user, password, timeout=10):
     return client
 
 
-def _exec(client, command, timeout=EXEC_TIMEOUT):
+def _exec(client, command, timeout=EXEC_TIMEOUT, stdin_text=None):
     # Every low-level failure is funnelled into SSHCommandError so callers have a
     # single exception type to handle. ConnectionResetError, socket.timeout and
     # paramiko's own SSHException all mean the same thing here: this command did
     # not produce an answer.
     try:
-        _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        if stdin_text is not None:
+            stdin.write(stdin_text)
+            stdin.flush()
         # Read before recv_exit_status(): reads honour the channel timeout, the
         # exit-status wait does not, so a dead link surfaces here instead of
         # hanging forever.
@@ -168,6 +171,67 @@ def reboot_device(client, password):
 
     if exit_status != 0:
         raise SSHCommandError(f"reboot failed: {err.decode(errors='replace').strip()}")
+
+
+# Where detection.py's per-process logs land on the Pi (utils/logger.py, edge_<ts>.log).
+EDGE_LOG_DIR = "/home/rasp/miniproj_epan/hailo-rpi5-examples/logs"
+
+# Fixed commands only — the operator picks a *key*, never text that reaches the shell.
+# {n} is the clamped line count, always an int by the time it is formatted in.
+LOG_SOURCES = {
+    "detection": ("hailo-detection service", "journalctl -u hailo-detection.service -n {n} --no-pager"),
+    "health-agent": ("health-agent service", "journalctl -u health-agent.service -n {n} --no-pager"),
+    "edge": (
+        "latest edge_*.log (app log)",
+        f"f=$(ls -t {EDGE_LOG_DIR}/edge_*.log 2>/dev/null | head -1); "
+        'if [ -n "$f" ]; then tail -n {n} "$f"; else echo \'no edge_*.log found\' >&2; exit 1; fi',
+    ),
+    "network": ("tailscaled service", "journalctl -u tailscaled -n {n} --no-pager"),
+    "boot-prev": ("previous boot (before last reboot)", "journalctl -b -1 -n {n} --no-pager"),
+}
+
+DEFAULT_LOG_LINES = 200
+MAX_LOG_LINES = 1000
+# The tail is what explains a crash, so that is the end kept when a source is bigger.
+MAX_LOG_BYTES = 256 * 1024
+LOG_TIMEOUT = 30
+
+# journalctl exits 0 and prints this when the user cannot read the system journal —
+# a quiet "success" that would otherwise render as a Pi with nothing to say.
+_JOURNAL_DENIED_HINT = b"not seeing messages from other users"
+
+
+def fetch_logs(client, source, lines=DEFAULT_LOG_LINES, password=None):
+    """Last `lines` lines of one whitelisted Pi log, as text.
+
+    Raises ValueError for an unknown source or a non-numeric line count (caller error),
+    SSHCommandError for anything the Pi or the link did.
+
+    journalctl is retried once under `sudo -S` when the first attempt shows the user cannot
+    read the journal; the password goes over stdin, never onto the command line. The edge
+    log is an ordinary file and is never sudo'd.
+    """
+    if source not in LOG_SOURCES:
+        raise ValueError(f"unknown log source {source!r}")
+    n = max(1, min(int(lines), MAX_LOG_LINES))
+    command = LOG_SOURCES[source][1].format(n=n)
+
+    out, err, exit_status = _exec(client, command, timeout=LOG_TIMEOUT)
+    needs_sudo = command.startswith("journalctl") and (
+        exit_status != 0 or _JOURNAL_DENIED_HINT in out + err
+    )
+    if needs_sudo and password:
+        out, err, exit_status = _exec(
+            client, f"sudo -S -p '' {command}", timeout=LOG_TIMEOUT, stdin_text=password + "\n",
+        )
+    if exit_status != 0:
+        raise SSHCommandError(f"log fetch failed: {err.decode(errors='replace').strip()}")
+
+    truncated = len(out) > MAX_LOG_BYTES
+    if truncated:
+        out = out[-MAX_LOG_BYTES:]
+    text = out.decode(errors="replace")
+    return f"[... older output truncated ...]\n{text}" if truncated else text
 
 
 def grab_screenshot(client):

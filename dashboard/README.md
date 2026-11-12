@@ -241,9 +241,62 @@ before or after the reboot.
 - A history write failure is logged and swallowed: the trend is a nice-to-have,
   the live status is not.
 
+## Clarity history
+
+`/history` (the "Clarity history" link in the header) lists when the camera was
+blurry, blank, obstructed or clear, e.g. "Blurry 14:02 → 14:37, 35 min". The Camera
+card only shows clarity as of now and Trends keeps ~24h of numbers; neither answers
+"was it blurry yesterday afternoon".
+
+- Stored in `logs/clarity_events.jsonl`, **transitions only** — the Pi re-checks
+  clarity about every 5 minutes while the dashboard polls every 30s, so a row per
+  poll would be mostly duplicates. Each row is stamped with when the check ran
+  (snapshot time minus `clarity.age_sec`).
+- **Recorded by the dashboard only.** While the laptop is off or the Pi unreachable
+  for more than 10 minutes, a `gap` is written and shown as "No data" — never as
+  "clear". `logs/clarity_events.seen` remembers the last fresh snapshot so this
+  survives a dashboard restart.
+- Camera down or clarity never checked is `unknown`, not `clear`.
+- Kept 30 days (plus the one row before the cutoff, so the oldest period has a
+  known state). `?filter=problems` hides clear/unknown; JSON at `/api/clarity-log`.
+- Clarity is advisory and its thresholds are barely calibrated, so some "blurry"
+  rows will be false positives.
+
 Only one SSH session runs at a time; a Refresh that arrives while one is in
 flight is dropped rather than queued — and says so, via a banner (button) or an
 HTTP 409 (auto-poll), instead of quietly re-rendering stale state.
+
+## Outage history and Pi logs
+
+When the pipeline suddenly stops, two pages answer "since when" and "why" without
+SSH or VS Code remote.
+
+**`/outages`** (the "Outages" link) lists running / pipeline down / agent stale
+periods, built like Clarity history: transitions only, in
+`logs/outage_events.jsonl`, 30 days, `gap` ("No data") when the dashboard could not see
+the Pi for more than 10 minutes, `?filter=problems`, JSON at `/api/outage-log`. Each
+*pipeline down* row also keeps the hailo-detection unit's own account of how it died
+(`result`, `exit_code`, `restarts`, `active_state/sub_state`) — `health.json` lives on
+tmpfs, so a reboot would otherwise wipe that evidence. A stale snapshot is recorded as
+*agent stale*, not skipped: a dead health-agent is an outage.
+
+**`/logs`** (the "Logs" link, also linked from the pipeline-down banner) fetches the
+last N lines (default 200, max 1000) of one log over SSH, on demand:
+
+| Source | Command run on the Pi |
+|---|---|
+| hailo-detection service | `journalctl -u hailo-detection.service` |
+| health-agent service | `journalctl -u health-agent.service` |
+| latest edge_*.log | `tail` of the newest `logs/edge_*.log` in the repo |
+| tailscaled service | `journalctl -u tailscaled` |
+| previous boot | `journalctl -b -1` |
+
+Sources are a fixed whitelist — the page sends a key, never shell text. Output is capped
+at 256 KB (the tail is kept), shown as plain text, with Copy and Download buttons. It
+shares the one-SSH-session lock, so it can return 503 "try again" mid-refresh. If the SSH
+user cannot read the journal, `journalctl` is retried once under `sudo -S` with the same
+password as Reboot Device (sent over stdin, never on the command line) — not yet
+verified against the real Pi.
 
 ## Logs
 

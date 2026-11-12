@@ -11,11 +11,17 @@
   <header class="topbar">
     <div class="topbar-row">
       <h1>🚛 Duromac Truck Monitor</h1>
+      <nav class="topnav">
+        <a href="{{ url_for('index') }}">Live</a>
+        <a href="{{ url_for('clarity_history') }}">Clarity history</a>
+        <a href="{{ url_for('outage_history') }}">Outages</a>
+        <a href="{{ url_for('logs_page') }}">Logs</a>
+      </nav>
     </div>
     {% block header_toolbar %}{% endblock %}
   </header>
 
-  <div id="banners">{% include "_banners.html" %}</div>
+  {% block banners %}<div id="banners">{% include "_banners.html" %}</div>{% endblock %}
 
   <main>
     {% block content %}{% endblock %}

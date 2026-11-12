@@ -13,8 +13,10 @@ import config
 import contacts
 import driver
 import geocode
+import clarity_log
 import history
 import logging_setup
+import outage_log
 import report
 import ssh_client
 import status
@@ -242,8 +244,10 @@ def index():
         "live_status.html", cards=cards, state=state, marker=marker, town=_current_town(),
         stale=stale, age_sec=age_sec, trends=trends,
         pipeline_alert=status.pipeline_down_while_connected(cards, stale),
+        pipeline_evidence=outage_log.detection_evidence(state["health"] or {}),
         driver_name=driver_name, report_text=_build_report(stale),
         contacts=contacts_list, driver_wa_link=_driver_wa_link(contacts_list, driver_name),
+        ssh_target=f"{config.SSH_USER or '<user>'}@{config.SSH_HOST or '<pi-ip>'}",
     )
 
 
@@ -272,6 +276,7 @@ def api_status():
         "banners_html": render_template(
             "_banners.html", state=state, stale=stale, age_sec=age_sec,
             pipeline_alert=status.pipeline_down_while_connected(cards, stale),
+            pipeline_evidence=outage_log.detection_evidence(state["health"] or {}),
         ),
         "cards_html": render_template("_cards.html", cards=cards),
         "trends_html": render_template("_trends.html", trends=history.build_trends(history.load())),
@@ -286,6 +291,113 @@ def api_status():
         ),
         "screenshot_error": state["screenshot_error"],
     }
+
+
+def _clarity_days(problems_only):
+    now = datetime.datetime.now()
+    return clarity_log.build_events(
+        clarity_log.load(), now=now, last_seen=clarity_log.last_seen(), problems_only=problems_only,
+    )
+
+
+@app.route("/history")
+def clarity_history():
+    """When the camera was blurry and when it was not, from the dashboard's own record."""
+    problems_only = request.args.get("filter") == "problems"
+    return render_template(
+        "history.html", days=_clarity_days(problems_only), problems_only=problems_only,
+        retention_days=clarity_log.RETENTION.days,
+    )
+
+
+@app.route("/api/clarity-log")
+def api_clarity_log():
+    days = _clarity_days(request.args.get("filter") == "problems")
+    return {"days": [
+        {"day": d["day"], "events": [
+            {**e, "start": e["start"].isoformat(timespec="seconds"),
+             "end": e["end"].isoformat(timespec="seconds")} for e in d["events"]]}
+        for d in days
+    ]}
+
+
+def _outage_days(problems_only):
+    now = datetime.datetime.now()
+    return outage_log.build_events(
+        outage_log.load(path=outage_log.OUTAGE_LOG_PATH), now=now,
+        last_seen=outage_log.last_seen(outage_log.OUTAGE_LOG_PATH), problems_only=problems_only,
+    )
+
+
+@app.route("/outages")
+def outage_history():
+    """When the detection pipeline was down, and what the service said about it."""
+    problems_only = request.args.get("filter") == "problems"
+    return render_template(
+        "outages.html", days=_outage_days(problems_only), problems_only=problems_only,
+        retention_days=outage_log.RETENTION.days,
+    )
+
+
+@app.route("/api/outage-log")
+def api_outage_log():
+    days = _outage_days(request.args.get("filter") == "problems")
+    return {"days": [
+        {"day": d["day"], "events": [
+            {**e, "start": e["start"].isoformat(timespec="seconds"),
+             "end": e["end"].isoformat(timespec="seconds")} for e in d["events"]]}
+        for d in days
+    ]}
+
+
+@app.route("/logs")
+def logs_page():
+    """The log viewer shell. Touches no SSH: POST /api/logs is what fetches."""
+    source = request.args.get("source")
+    if source not in ssh_client.LOG_SOURCES:
+        source = "detection"
+    return render_template(
+        "logs.html", sources=[(key, label) for key, (label, _) in ssh_client.LOG_SOURCES.items()],
+        selected=source, default_lines=ssh_client.DEFAULT_LOG_LINES,
+        max_lines=ssh_client.MAX_LOG_LINES,
+    )
+
+
+@app.route("/api/logs", methods=["POST"])
+def fetch_logs():
+    source = request.form.get("source", "")
+    if source not in ssh_client.LOG_SOURCES:
+        return Response("unknown log source", status=400, mimetype="text/plain")
+    try:
+        lines = int(request.form.get("lines", ssh_client.DEFAULT_LOG_LINES))
+    except ValueError:
+        return Response("lines must be a number", status=400, mimetype="text/plain")
+
+    if not _ssh_lock.acquire(blocking=False):
+        return Response("another SSH request is in flight, try again", status=503, mimetype="text/plain")
+    try:
+        return _do_fetch_logs(source, lines)
+    finally:
+        _ssh_lock.release()
+
+
+def _do_fetch_logs(source, lines):
+    try:
+        client = _ssh_session_for_use()
+    except Exception as exc:
+        state["connection_error"] = str(exc)
+        drop_ssh_session()
+        log.exception("SSH connect to %s failed for a log fetch", config.SSH_HOST)
+        return Response(str(exc), status=502, mimetype="text/plain")
+
+    try:
+        text = ssh_client.fetch_logs(client, source, lines, password=config.SSH_PASSWORD)
+    except Exception as exc:
+        drop_ssh_session()
+        log.exception("log fetch (%s) failed", source)
+        return Response(str(exc), status=502, mimetype="text/plain")
+
+    return {"source": source, "text": text, "fetched_at": _format_ts(datetime.datetime.now())}
 
 
 def _format_ts(value):
@@ -457,6 +569,16 @@ def _do_refresh():
             history.record(state["health"], state["health_age_sec"])
         except Exception:
             log.exception("could not record trend history")
+
+        try:
+            clarity_log.record(state["health"], state["health_age_sec"])
+        except Exception:
+            log.exception("could not record clarity history")
+
+        try:
+            outage_log.record(state["health"], state["health_age_sec"])
+        except Exception:
+            log.exception("could not record outage history")
 
         state["last_refreshed"] = datetime.datetime.now()
     finally:

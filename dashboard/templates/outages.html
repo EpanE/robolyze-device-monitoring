@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{# Same event-list shape as history.html: the question is "when, for how long, and what did
+   the service say", which rows of text answer exactly. Periods come from outage_log.build_events. #}
+{# No live banners here: they describe the current snapshot, which this page does not load. #}
+{% block banners %}{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>Pipeline outage history</h2>
+  <p class="hint">
+    Recorded by this dashboard while it is running and the Pi is reachable; kept
+    {{ retention_days }} days. Time with no readings is shown as “No data”, never as running.
+    To see <em>why</em> a period went down, open the <a href="{{ url_for('logs_page', source='detection') }}">logs</a>.
+  </p>
+  <div class="filter-row">
+    <a class="filter-link{% if not problems_only %} active{% endif %}" href="{{ url_for('outage_history') }}">All</a>
+    <a class="filter-link{% if problems_only %} active{% endif %}" href="{{ url_for('outage_history', filter='problems') }}">Problems only</a>
+  </div>
+
+  {% if days %}
+    {% for day in days %}
+      <h3 class="event-day">{{ day.day }}</h3>
+      <ul class="event-list">
+        {% for e in day.events %}
+          <li class="event state-{{ e.state }}">
+            <span class="event-state">{{ 'No data' if e.state == 'gap' else e.state.replace('_', ' ')|capitalize }}</span>
+            <span class="event-time">
+              {{ e.start_text }} →
+              {% if e.ongoing %}now{% else %}{{ e.end_text }}{% endif %}
+            </span>
+            <span class="event-duration">{{ e.duration_text }}{% if e.ongoing %} so far{% endif %}</span>
+            {% if e.evidence %}
+              <span class="event-score">
+                {% if e.evidence.active_state %}{{ e.evidence.active_state }}{% if e.evidence.sub_state %}/{{ e.evidence.sub_state }}{% endif %} ·{% endif %}
+                {% if e.evidence.result is defined %}result {{ e.evidence.result }} ·{% endif %}
+                {% if e.evidence.exit_code is defined %}exit code {{ e.evidence.exit_code }} ·{% endif %}
+                {% if e.evidence.restarts is defined %}restarts {{ e.evidence.restarts }}{% endif %}
+              </span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endfor %}
+  {% else %}
+    <p class="hint">No outage history yet{% if problems_only %} (or no problems in the last {{ retention_days }} days){% endif %}. It builds up as the dashboard refreshes.</p>
+  {% endif %}
+</section>
+{% endblock %}

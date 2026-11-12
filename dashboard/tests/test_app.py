@@ -68,6 +68,9 @@ def reset_state(monkeypatch, tmp_path):
     # trend row, so without this every test writing to the repo's own logs/history.jsonl
     # would both litter the working tree and leak rows into the next test's assertions.
     monkeypatch.setattr(app_module.history, "HISTORY_PATH", tmp_path / "history.jsonl")
+    # Same reason: a refresh records clarity transitions too.
+    monkeypatch.setattr(app_module.clarity_log, "CLARITY_LOG_PATH", tmp_path / "clarity_events.jsonl")
+    monkeypatch.setattr(app_module.outage_log, "OUTAGE_LOG_PATH", tmp_path / "outage_events.jsonl")
     monkeypatch.setattr(app_module.driver, "DRIVER_PATH", tmp_path / "driver.json")
     contacts_path = tmp_path / "contacts.json"
     contacts_path.write_text(json.dumps(CONTACTS_FIXTURE), encoding="utf-8")
@@ -954,6 +957,32 @@ def test_cross_origin_reboot_is_rejected(client, monkeypatch):
     assert resp.status_code == 403
 
 
+def test_manual_reboot_commands_are_shown_with_configured_host_and_user(client, monkeypatch):
+    monkeypatch.setattr(config, "SSH_HOST", "100.1.2.3")
+    monkeypatch.setattr(config, "SSH_USER", "rasp")
+
+    html = client.get("/").get_data(as_text=True)
+
+    assert "ssh rasp@100.1.2.3" in html
+    assert 'ssh -t rasp@100.1.2.3 &#34;sudo reboot&#34;' in html or 'ssh -t rasp@100.1.2.3 "sudo reboot"' in html
+    assert "sudo reboot" in html
+
+
+def test_manual_reboot_commands_never_leak_the_ssh_password(client, monkeypatch):
+    monkeypatch.setattr(config, "SSH_PASSWORD", "hunter2-secret")
+
+    assert b"hunter2-secret" not in client.get("/").data
+
+
+def test_manual_reboot_commands_fall_back_to_placeholders_when_unconfigured(client, monkeypatch):
+    monkeypatch.setattr(config, "SSH_HOST", "")
+    monkeypatch.setattr(config, "SSH_USER", "")
+
+    html = client.get("/").get_data(as_text=True)
+
+    assert "&lt;user&gt;@&lt;pi-ip&gt;" in html
+
+
 # --- driver name ----------------------------------------------------------------------
 
 
@@ -1513,3 +1542,298 @@ def test_status_route_carries_the_trends(client, monkeypatch, history_path):
     payload = client.get("/api/status").get_json()
 
     assert "<polyline" in payload["trends_html"]
+
+
+# --- clarity history ----------------------------------------------------------------
+
+
+@pytest.fixture
+def clarity_path():
+    """The isolated clarity log reset_state already pointed the app at."""
+    return app_module.clarity_log.CLARITY_LOG_PATH
+
+
+def _blurry_health():
+    health = json.loads(json.dumps(HEALTHY_HEALTH))
+    clarity = health["camera"]["clarity"]
+    clarity.update({"clear": False, "blurry": True, "blur_score": 9.1})
+    return health
+
+
+def test_refresh_records_a_clarity_row(client, monkeypatch, clarity_path):
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    client.post("/api/refresh")
+
+    assert [r["state"] for r in app_module.clarity_log.load(path=clarity_path)] == ["clear"]
+
+
+def test_a_clarity_log_failure_does_not_break_the_refresh(client, monkeypatch, clarity_path):
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(app_module.clarity_log, "record", boom)
+
+    resp = client.post("/api/refresh")
+
+    assert resp.status_code == 302
+    assert app_module.state["health"] == HEALTHY_HEALTH
+
+
+def test_history_page_says_so_when_nothing_is_recorded(client, clarity_path):
+    resp = client.get("/history")
+
+    assert resp.status_code == 200
+    assert "No clarity history" in resp.get_data(as_text=True)
+
+
+def test_history_page_lists_transitions(client, clarity_path):
+    # Seeded with real elapsed time: two refreshes in one test land in the same second,
+    # and a zero-length period is deliberately not shown.
+    now = datetime.datetime.now()
+    app_module.clarity_log.record(HEALTHY_HEALTH, 5.0, now=now - datetime.timedelta(minutes=30))
+    app_module.clarity_log.record(_blurry_health(), 5.0, now=now - datetime.timedelta(minutes=10))
+
+    body = client.get("/history").get_data(as_text=True)
+
+    assert "Blurry" in body
+    assert "Clear" in body
+
+
+def test_history_problems_filter_hides_clear_periods(client, monkeypatch, clarity_path):
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    client.post("/api/refresh")
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (_blurry_health(), 5.0))
+    client.post("/api/refresh")
+
+    body = client.get("/history?filter=problems").get_data(as_text=True)
+
+    assert "Blurry" in body
+    assert 'class="event state-clear' not in body
+
+
+def test_clarity_log_api_returns_events(client, monkeypatch, clarity_path):
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (_blurry_health(), 5.0))
+    client.post("/api/refresh")
+
+    payload = client.get("/api/clarity-log").get_json()
+
+    [day] = payload["days"]
+    assert day["events"][0]["state"] == "blurry"
+    assert day["events"][0]["ongoing"] is True
+
+
+def test_history_requires_the_password_when_one_is_set(client, monkeypatch, clarity_path):
+    monkeypatch.setattr(app_module.config, "DASHBOARD_PASSWORD", "hunter2")
+
+    assert client.get("/history").status_code == 401
+    assert client.get("/api/clarity-log").status_code == 401
+
+
+# --- outage history -----------------------------------------------------------------
+
+
+def _dead_pipeline_health():
+    health = json.loads(json.dumps(HEALTHY_HEALTH))
+    health["pipeline"] = {"ok": False, "error": "not running"}
+    health["service"] = {"hailo-detection.service": {
+        "ok": False, "active_state": "failed", "sub_state": "failed", "result": "exit-code",
+        "exit_code": "1", "restarts": 5, "uptime_sec": 0.0,
+    }}
+    return health
+
+
+@pytest.fixture
+def outage_path():
+    return app_module.outage_log.OUTAGE_LOG_PATH
+
+
+def test_refresh_records_an_outage_row(client, monkeypatch, outage_path):
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    client.post("/api/refresh")
+
+    assert [r["state"] for r in app_module.outage_log.load(path=outage_path)] == ["running"]
+
+
+def test_an_outage_log_failure_does_not_break_the_refresh(client, monkeypatch, outage_path):
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(app_module.outage_log, "record", boom)
+
+    resp = client.post("/api/refresh")
+
+    assert resp.status_code == 302
+    assert app_module.state["health"] == HEALTHY_HEALTH
+
+
+def test_outages_page_says_so_when_nothing_is_recorded(client, outage_path):
+    resp = client.get("/outages")
+
+    assert resp.status_code == 200
+    assert "No outage history" in resp.get_data(as_text=True)
+
+
+def test_outages_page_lists_a_pipeline_outage_with_its_evidence(client, outage_path):
+    now = datetime.datetime.now()
+    # Minutes apart, not tens of them: a longer silence is (correctly) recorded as a gap.
+    app_module.outage_log.record(HEALTHY_HEALTH, 5.0, now=now - datetime.timedelta(minutes=8))
+    app_module.outage_log.record(_dead_pipeline_health(), 5.0, now=now - datetime.timedelta(minutes=5))
+
+    body = client.get("/outages").get_data(as_text=True)
+
+    assert "Pipeline down" in body
+    assert "exit-code" in body
+    assert "restarts 5" in body
+
+
+def test_outages_problems_filter_hides_running_periods(client, monkeypatch, outage_path):
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (HEALTHY_HEALTH, 5.0))
+    client.post("/api/refresh")
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (_dead_pipeline_health(), 5.0))
+    client.post("/api/refresh")
+
+    body = client.get("/outages?filter=problems").get_data(as_text=True)
+
+    assert "Pipeline down" in body
+    assert 'class="event state-running' not in body
+
+
+def test_outage_log_api_returns_events(client, monkeypatch, outage_path):
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (_dead_pipeline_health(), 5.0))
+    client.post("/api/refresh")
+
+    [day] = client.get("/api/outage-log").get_json()["days"]
+
+    assert day["events"][0]["state"] == "pipeline_down"
+    assert day["events"][0]["evidence"]["restarts"] == 5
+
+
+def test_outages_require_the_password_when_one_is_set(client, monkeypatch, outage_path):
+    monkeypatch.setattr(app_module.config, "DASHBOARD_PASSWORD", "hunter2")
+
+    assert client.get("/outages").status_code == 401
+    assert client.get("/api/outage-log").status_code == 401
+
+
+# --- log viewer ---------------------------------------------------------------------
+
+
+def test_logs_page_renders_without_opening_ssh(client, monkeypatch):
+    def no_ssh(*a, **k):
+        raise AssertionError("GET /logs must not open SSH")
+
+    monkeypatch.setattr(ssh_client, "connect", no_ssh)
+
+    resp = client.get("/logs")
+
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "hailo-detection" in body
+    assert "health-agent" in body
+
+
+def test_logs_page_preselects_the_requested_source(client):
+    body = client.get("/logs?source=network").get_data(as_text=True)
+
+    assert 'value="network" selected' in body
+
+
+def test_logs_api_returns_the_fetched_text(client, monkeypatch):
+    seen = {}
+
+    def fake_fetch(c, source, lines, password=None):
+        seen.update(source=source, lines=lines, password=password)
+        return "line one\nline two\n"
+
+    monkeypatch.setattr(ssh_client, "fetch_logs", fake_fetch)
+
+    resp = client.post("/api/logs", data={"source": "detection", "lines": "50"})
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["text"] == "line one\nline two\n"
+    assert payload["source"] == "detection"
+    assert seen["lines"] == 50
+    assert seen["password"] == app_module.config.SSH_PASSWORD
+
+
+def test_logs_api_rejects_an_unknown_source(client):
+    resp = client.post("/api/logs", data={"source": "../etc/passwd", "lines": "50"})
+
+    assert resp.status_code == 400
+
+
+def test_logs_api_rejects_a_non_numeric_line_count(client):
+    resp = client.post("/api/logs", data={"source": "detection", "lines": "many"})
+
+    assert resp.status_code == 400
+
+
+def test_logs_api_returns_502_when_the_fetch_fails(client, monkeypatch):
+    def fail(c, source, lines, password=None):
+        raise ssh_client.SSHCommandError("timed out after 30s")
+
+    monkeypatch.setattr(ssh_client, "fetch_logs", fail)
+
+    resp = client.post("/api/logs", data={"source": "detection", "lines": "50"})
+
+    assert resp.status_code == 502
+    assert "timed out" in resp.get_data(as_text=True)
+
+
+def test_logs_api_returns_502_when_ssh_cannot_connect(client, monkeypatch):
+    def refuse(*a, **k):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(ssh_client, "connect", refuse)
+
+    resp = client.post("/api/logs", data={"source": "detection", "lines": "50"})
+
+    assert resp.status_code == 502
+
+
+def test_logs_api_is_rejected_while_another_ssh_request_is_in_flight(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "fetch_logs", lambda *a, **k: "x")
+
+    app_module._ssh_lock.acquire()
+    try:
+        resp = client.post("/api/logs", data={"source": "detection", "lines": "50"})
+    finally:
+        app_module._ssh_lock.release()
+
+    assert resp.status_code == 503
+
+
+def test_cross_origin_log_fetch_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "fetch_logs", lambda *a, **k: "x")
+
+    resp = client.post("/api/logs", data={"source": "detection", "lines": "50"},
+                       headers={"Origin": "http://evil.example"})
+
+    assert resp.status_code == 403
+
+
+def test_dead_pipeline_banner_links_to_the_detection_logs(client, monkeypatch):
+    monkeypatch.setattr(ssh_client, "fetch_health_snapshot", lambda c: (_dead_pipeline_health(), 12.0))
+    monkeypatch.setattr(ssh_client, "fetch_tailscale_status", lambda c: HEALTHY_TAILSCALE)
+
+    client.post("/api/refresh")
+    body = client.get("/").get_data(as_text=True)
+
+    assert "/logs?source=detection" in body
+    assert "exit-code" in body
+    assert "restarts 5" in body
